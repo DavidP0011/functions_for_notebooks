@@ -1,0 +1,18 @@
+# Configuración del sistema de construcción del paquete
+[build-system]
+requires = ["setuptools>=68", "wheel"]  # Paquete py para construir el paquete: setuptools versión 68+ y wheel
+build-backend = "setuptools.build_meta" # Backend que se usará para construir el paquete (setuptools es el estándar)
+
+# Metadatos principales del proyecto
+[project]
+name = "utilidades-notebooks"          # Nombre del paquete (debe ser único en PyPI, todo minúsculas y sin espacios)
+version = "0.2.0"                     # Versión actual del paquete (formato semántico: mayor.menor.parche)
+description = "Funciones reutilizables para mis notebooks" # Descripción breve del paquete
+readme = "README.md"                   # Archivo que contiene la descripción larga (se mostrará en PyPI)
+requires-python = ">=3.9"             # Versión mínima de Python requerida para usar este paquete
+authors = [{name="David Plaza"}]       # Lista de autores del paquete (puedes agregar email con 'email="tu@email.com"')
+dependencies = []                      # Lista de paquetes de los que depende este proyecto (actualmente vacía)
+
+# Configuración para encontrar los paquetes Python
+[tool.setuptools.packages.find]
+where = ["src"]                        # Directorio donde buscar los paquetes Python (estructura src/ es una buena práctica)
