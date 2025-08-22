@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta" # Backend que se usará para construir e
 
 # Metadatos principales del proyecto
 [project]
-name = "utilidades-notebooks"          # Nombre del paquete (debe ser único en PyPI, todo minúsculas y sin espacios)
-version = "0.2.0"                     # Versión actual del paquete (formato semántico: mayor.menor.parche)
+name = "funcones-py-notebooks"          # Nombre del paquete (debe ser único en PyPI, todo minúsculas y sin espacios)
+dynamic = ["version"]  # ¡La versión ahora es dinámica! Se obtiene automáticamente de los tags
 description = "Funciones reutilizables para mis notebooks" # Descripción breve del paquete
 readme = "README.md"                   # Archivo que contiene la descripción larga (se mostrará en PyPI)
 requires-python = ">=3.9"             # Versión mínima de Python requerida para usar este paquete
@@ -16,3 +16,6 @@ dependencies = []                      # Lista de paquetes de los que depende es
 # Configuración para encontrar los paquetes Python
 [tool.setuptools.packages.find]
 where = ["src"]                        # Directorio donde buscar los paquetes Python (estructura src/ es una buena práctica)
+
+# Configuración del versionado automático
+[tool.setuptools_scm]
