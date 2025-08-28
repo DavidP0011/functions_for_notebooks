@@ -1,7 +1,3 @@
-from dpm_common_functions import _ini_authenticate_API
-import pandas as pd
-
-
 # __________________________________________________________________________________________________________________________________________________________
 def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
     """
