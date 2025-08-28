@@ -1,5 +1,3 @@
-from dpm_common_functions import _ini_authenticate_API
-
 import os
 import json
 import gzip
