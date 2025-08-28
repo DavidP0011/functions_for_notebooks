@@ -1,1 +1,1 @@
-from dpm_common_functions import _ini_authenticate_API
+from common import _ini_authenticate_API
