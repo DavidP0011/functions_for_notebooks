@@ -1,11 +1,8 @@
-# __________________________________________________________________________________________________________________________________________________________
-# Repositorio de funciones
-# __________________________________________________________________________________________________________________________________________________________
+from common.dpm_GCP_ini import _ini_authenticate_API
+
 from google.cloud import bigquery
 import pandas as pd
 import pandas_gbq
-
-from dpm_common_functions import _ini_authenticate_API
 
 import unicodedata
 import re
