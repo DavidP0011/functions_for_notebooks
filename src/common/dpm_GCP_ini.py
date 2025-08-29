@@ -111,7 +111,7 @@ def ini_environment_identification() -> str:
 
 
 # __________________________________________________________________________________________________________________________________________________________
-# environment_identification
+# ini_google_drive_instalation
 # __________________________________________________________________________________________________________________________________________________________
 def ini_google_drive_instalation(params: dict) -> None:
     """
@@ -145,3 +145,63 @@ def ini_google_drive_instalation(params: dict) -> None:
             print(f"[ERROR ❌] No se pudo importar google.colab para montar Google Drive: {e}", flush=True)
     else:
         print(f"[INFO ℹ️] El entorno '{entorno_identificado_str}' no requiere montaje de Google Drive.", flush=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# _______________________________________________________________________________________________
+# ini_google_secret_manager_instalation
+# _______________________________________________________________________________________________
+def ini_google_secret_manager_instalation(params: dict) -> None:
+    """
+    Instala la librería google‑cloud‑secret‑manager en función del entorno de ejecución.
+
+    Args:
+        params (dict):
+            - entorno_identificado_str (str): Valor que indica el entorno de ejecución.
+              Los posibles valores pueden ser:
+                * 'LOCAL'
+                * 'COLAB'
+                * 'COLAB_ENTERPRISE'
+                * Cualquier otro valor que indique un entorno diferente (por ejemplo, el nombre de un proyecto GCP).
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: Si falta la key 'entorno_identificado_str' en params.
+    """
+    import subprocess
+    import sys
+
+    entorno_identificado_str = params.get('entorno_identificado_str')
+    if not entorno_identificado_str:
+        raise ValueError("[VALIDATION [ERROR ❌]] Falta la key 'entorno_identificado_str' en params.")
+
+    # Instalar Secret Manager sólo en entornos donde no suele estar disponible
+    if entorno_identificado_str in ['LOCAL', 'COLAB_ENTERPRISE']:
+        try:
+            print(f"[INFO ℹ️] Instalando google‑cloud‑secret‑manager en entorno '{entorno_identificado_str}'...", flush=True)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "google-cloud-secret-manager"])
+            # Verificamos que se pueda importar
+            import google.cloud.secretmanager  # noqa: F401
+            print("[INFO ✅] Librería google‑cloud‑secret‑manager instalada y disponible.", flush=True)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR ❌] Error al instalar google‑cloud‑secret‑manager: {e}", flush=True)
+        except ImportError as e:
+            print(f"[ERROR ❌] La instalación se realizó, pero no se pudo importar la librería: {e}", flush=True)
+    else:
+        print(f"[INFO ℹ️] El entorno '{entorno_identificado_str}' ya gestiona la librería de Secret Manager; no es necesaria la instalación.", flush=True)
+
