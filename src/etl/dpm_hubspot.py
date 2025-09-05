@@ -2,16 +2,6 @@ from __future__ import annotations
 
 from common.dpm_GCP_ini import _ini_authenticate_API
 
-import time
-from datetime import datetime, timezone
-from os import getenv
-from typing import Any, Dict, List, Optional
-
-import pandas as pd
-import requests
-from google.cloud import secretmanager
-
-
 # __________________________________________________________________________________________________________________________________________________________
 # HS_sensitive_data_to_df
 # __________________________________________________________________________________________________________________________________________________________
@@ -38,6 +28,15 @@ def HS_sensitive_data_to_df(config: Dict[str, Any]) -> pd.DataFrame:
       HS_debug_contact_id                           : int|str
       HS_return_partial_on_error_bool               : bool
     """
+
+    import time
+    from datetime import datetime, timezone
+    from os import getenv
+    from typing import Any, Dict, List, Optional
+
+    import pandas as pd
+    import requests
+    from google.cloud import secretmanager
 
     # ───────────────── Helpers ─────────────────
     def _to_ms(value: Any) -> int:
