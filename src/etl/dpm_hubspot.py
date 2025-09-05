@@ -1,6 +1,6 @@
-from common.dpm_GCP_ini import _ini_authenticate_API
-
 from __future__ import annotations
+
+from common.dpm_GCP_ini import _ini_authenticate_API
 
 import time
 from datetime import datetime, timezone
