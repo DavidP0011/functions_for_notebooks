@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 from google.cloud import secretmanager
 
-from common.dpm_GCP_ini import _ini_authenticate_API   )
+from common.dpm_GCP_ini import _ini_authenticate_API
 
 
 # __________________________________________________________________________________________________________________________________________________________
