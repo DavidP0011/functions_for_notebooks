@@ -1,47 +1,71 @@
 # __________________________________________________________________________________________________________________________________________________________
 # _ini_authenticate_API
 # __________________________________________________________________________________________________________________________________________________________
-def _ini_authenticate_API(config: dict, project_id: str):
+def _ini_authenticate_API(p: dict, project_id_str: str, scopes: list):
     """
-    Autentica utilizando el diccionario común en config.
-    
-    Dependiendo de 'ini_environment_identificated' se utiliza:
-      - "LOCAL": usa la key "json_keyfile_local"
-      - "COLAB": usa la key "json_keyfile_colab"
-      - Para GCP (por ejemplo, "COLAB_ENTERPRISE" o un project_id): usa "json_keyfile_GCP_secret_id"
-      
-    Args:
-      config (dict): Diccionario de configuración.
-      project_id (str): ID del proyecto GCP (se usa en la autenticación GCP).
-      
-    Returns:
-      Credentials: Objeto de credenciales para la autenticación.
+    Devuelve credenciales con los SCOPES solicitados, priorizando:
+    1) Secret Manager (json_keyfile_GCP_secret_id)
+    2) Keyfile local/colab si existe en disco
+    3) ADC (default()) solo si soporta scopes adecuados
     """
-    from google.oauth2 import service_account
-    env = config.get("ini_environment_identificated", "COLAB")
-    if env == "LOCAL":
-        json_path = config.get("json_keyfile_local")
-        if not json_path:
-            raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_local' en config para entorno LOCAL.")
-        credentials = service_account.Credentials.from_service_account_file(json_path)
-    elif env == "COLAB":
-        json_path = config.get("json_keyfile_colab")
-        if not json_path:
-            raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_colab' en config para entorno COLAB.")
-        credentials = service_account.Credentials.from_service_account_file(json_path)
-    else:
-        secret_id = config.get("json_keyfile_GCP_secret_id")
-        if not secret_id:
-            raise ValueError("[AUTHENTICATION ERROR ❌] Falta 'json_keyfile_GCP_secret_id' en config para entornos GCP.")
-        from google.cloud import secretmanager
-        client_sm = secretmanager.SecretManagerServiceClient()
-        secret_name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
-        response = client_sm.access_secret_version(name=secret_name)
-        secret_str = response.payload.data.decode("UTF-8")
-        import json
-        secret_info = json.loads(secret_str)
-        credentials = service_account.Credentials.from_service_account_info(secret_info)
-    return credentials
+    import os, json
+    from google.oauth2.service_account import Credentials as SACreds
+    from google.auth import default as default_auth
+    from google.auth.transport.requests import Request
+
+    env_str = (p.get("ini_environment_identificated") or "").upper().strip()
+    key_local_path_str = (p.get("json_keyfile_local") or "").strip()
+    key_colab_path_str = (p.get("json_keyfile_colab") or "").strip()
+    secret_id_str = (p.get("json_keyfile_GCP_secret_id") or "").strip()
+
+    # 1) Intentar SECRET MANAGER (recomendado en GCP / COLAB_ENTERPRISE)
+    if secret_id_str:
+        try:
+            from google.cloud import secretmanager
+            sm_client = secretmanager.SecretManagerServiceClient()
+            secret_name = f"projects/{project_id_str}/secrets/{secret_id_str}/versions/latest"
+            payload_bytes = sm_client.access_secret_version(name=secret_name).payload.data
+            sa_info_dic = json.loads(payload_bytes.decode("utf-8"))
+            creds = SACreds.from_service_account_info(sa_info_dic, scopes=scopes)
+            print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde Secret Manager con scopes de Sheets/Drive.", flush=True)
+            return creds
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Secret Manager no disponible o secreto inválido: {e}", flush=True)
+
+    # 2) Keyfile en disco si existe
+    for candidate in [key_colab_path_str, key_local_path_str]:
+        if candidate and os.path.exists(candidate):
+            try:
+                creds = SACreds.from_service_account_file(candidate, scopes=scopes)
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile: {candidate}", flush=True)
+                return creds
+            except Exception as e:
+                print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile inválido ({candidate}): {e}", flush=True)
+
+    # 3) ADC (solo si realmente aporta scopes válidos)
+    creds, _ = default_auth()  # Ojo: aquí NO siempre vienen los scopes que pides
+    try:
+        # Si las credenciales requieren scopes, intentalo:
+        if getattr(creds, "requires_scopes", False):
+            creds = creds.with_scopes(scopes)
+        # Refrescar para validar
+        creds.refresh(Request())
+    except Exception as e:
+        print(f"[AUTHENTICATION [WARNING ⚠️]] ADC no refresca con scopes deseados: {e}", flush=True)
+
+    # Heurística: si es Compute/GCE o Workbench y no soporta scopes de Sheets → mensaje claro
+    # No todos los tipos implementan has_scopes; comprobamos best-effort:
+    missing_scopes_list = [s for s in scopes if not getattr(creds, "has_scopes", lambda _: True)([s])]
+    if missing_scopes_list:
+        raise RuntimeError(
+            "[AUTHENTICATION [ERROR ❌]] El token ADC no incluye scopes de Sheets/Drive. "
+            "En Colab Enterprise o GCP usa 'json_keyfile_GCP_secret_id' (Service Account en Secret Manager) "
+            "o proporciona un keyfile en 'json_keyfile_colab'/'json_keyfile_local'."
+        )
+
+    print("[AUTHENTICATION [SUCCESS ✅]] ADC válido con scopes requeridos.", flush=True)
+    return creds
+
 
 
 
