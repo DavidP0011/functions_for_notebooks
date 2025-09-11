@@ -1,4 +1,6 @@
 from common.dpm_GCP_ini import _ini_authenticate_API
+    
+import pandas as pd
 
 # __________________________________________________________________________________________________________________________________________________________
 # HS_sensitive_data_to_df
@@ -37,7 +39,6 @@ def HS_sensitive_data_to_df(config: dict) -> pd.DataFrame:
     from datetime import datetime, timezone, timedelta
     from typing import Any, Dict, List, Optional, Tuple
     
-    import pandas as pd
     import requests
 
     print("🔹🔹🔹 [START ▶️] Extracción HubSpot (sensibles) → DataFrame 🔹🔹🔹", flush=True)
