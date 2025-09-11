@@ -198,13 +198,13 @@ def ini_GCP_get_secret_manager(config: dict) -> dict:
     - ini_environment_identificated (str): "LOCAL" | "COLAB" | "COLAB_ENTERPRISE" | "GCP"
     - GCP_json_keyfile_local (str): Ruta al JSON si entorno=LOCAL
     - GCP_json_keyfile_colab (str): Ruta al JSON si entorno=COLAB o COLAB_ENTERPRISE
-    - GCP_json_keyfile_GCP_secret_id (str): ID corto o recurso completo de Secret Manager con el JSON de SA (solo GCP)
-    - GBQ_project_id (str): "animum-dev-datawarehouse" (usado como project_id por defecto para IDs cortos)
-    - GCP_secrets_requests_list (list): Lista de secretos a obtener (str o dict, ver más abajo)
+    - GCP_json_keyfile_GCP_secret_id (str): ID corto o recurso completo del secreto con el JSON de SA (para GCP)
+    - GBQ_project_id (str): "animum-dev-datawarehouse" (project_id por defecto para IDs cortos)
+    - GCP_secrets_requests_list (list): Lista de secretos a obtener (str o dict, ver abajo)
 
     Opcionales
     ----------
-    - as_bytes_bool (bool): False por defecto (devuelve str UTF-8)
+    - as_bytes_bool (bool): False → str UTF-8; True → bytes
     - max_retries_int (int): 3
     - retry_backoff_secs_float (float): 1.0
     - error_if_missing_bool (bool): True
@@ -281,7 +281,7 @@ def ini_GCP_get_secret_manager(config: dict) -> dict:
             ver = "unknown"
         _log(f"[DEPENDENCY SUCCESS ✅] Librería lista. Versión: {ver}")
 
-    # ---------------- Helpers recursos secretos ----------------
+    # ---------------- Helpers de recursos ----------------
     def _is_full_resource(name: str) -> bool:
         return isinstance(name, str) and name.startswith("projects/") and "/secrets/" in name
 
@@ -296,13 +296,12 @@ def ini_GCP_get_secret_manager(config: dict) -> dict:
     if not env:
         raise ValueError("[VALIDATION [ERROR ❌]] Falta 'ini_environment_identificated'.")
 
-    # Claves obligatorias de rutas / id SA
     req_keys = ["GCP_json_keyfile_local", "GCP_json_keyfile_colab", "GCP_json_keyfile_GCP_secret_id", "GBQ_project_id", "GCP_secrets_requests_list"]
     missing = [k for k in req_keys if k not in config]
     if missing:
         raise ValueError(f"[VALIDATION [ERROR ❌]] Faltan claves obligatorias: {missing}")
 
-    project_id = config.get("GBQ_project_id")  # Usaremos este como default project
+    project_id = config.get("GBQ_project_id")
     secrets_requests = config.get("GCP_secrets_requests_list")
     if not isinstance(secrets_requests, list) or not secrets_requests:
         raise ValueError("[VALIDATION [ERROR ❌]] 'GCP_secrets_requests_list' debe ser lista no vacía.")
@@ -315,22 +314,29 @@ def ini_GCP_get_secret_manager(config: dict) -> dict:
     _log("🔹🔹🔹 [START ▶️] Secret Manager: inicialización + obtención 🔹🔹🔹")
     _log(f"[INFO ℹ️] Entorno: {env} | Proyecto por defecto: {project_id}")
 
-    # ---------------- Dependencia ----------------
+    # ---------------- Dependencias ----------------
     _ensure_dependency_installed(config)
     from google.cloud import secretmanager
     from google.api_core import exceptions as gax
 
-    # ---------------- Selección de credenciales por entorno ----------------
+    # ---------------- Selección de credenciales por entorno (robusta) ----------------
     def _set_adc_from_path(path: str):
         if not path or not os.path.exists(path):
             raise ValueError(f"[VALIDATION [ERROR ❌]] Ruta credenciales inválida o inexistente: {path}")
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
         _log(f"[AUTHENTICATION [INFO] ℹ️] GOOGLE_APPLICATION_CREDENTIALS set → {path}")
 
+    def _adc_available() -> bool:
+        try:
+            from google.auth import default as google_auth_default
+            creds, _ = google_auth_default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            return creds is not None
+        except Exception:
+            return False
+
     def _bootstrap_sa_from_secret_id(secret_id_or_resource: str, default_project: str) -> str:
         """
-        Lee el JSON de SA desde Secret Manager (usando ADC del entorno GCP),
-        escribe a un archivo temporal y devuelve su ruta.
+        Lee el JSON de SA desde Secret Manager, lo guarda temporalmente y devuelve su ruta.
         """
         # Resolver recurso completo
         if _is_full_resource(secret_id_or_resource):
@@ -340,14 +346,13 @@ def ini_GCP_get_secret_manager(config: dict) -> dict:
                 raise ValueError("[VALIDATION [ERROR ❌]] Falta 'GBQ_project_id' para resolver el secret_id del SA en GCP.")
             resource = _resource_from_parts(default_project, secret_id_or_resource, "latest")
 
-        # Cliente temporal con ADC del entorno
         tmp_client = secretmanager.SecretManagerServiceClient()
         resp = tmp_client.access_secret_version(name=resource)
         sa_bytes = resp.payload.data
 
-        # Persistir a archivo temporal
+        # Validar JSON y persistir
         try:
-            json.loads(sa_bytes.decode("utf-8"))  # validación rápida
+            json.loads(sa_bytes.decode("utf-8"))
         except Exception as e:
             raise ValueError(f"[VALIDATION [ERROR ❌]] El secreto de SA no es JSON válido: {e}") from e
 
@@ -359,20 +364,33 @@ def ini_GCP_get_secret_manager(config: dict) -> dict:
 
     if env == "LOCAL":
         _set_adc_from_path(config.get("GCP_json_keyfile_local"))
-    elif env in ("COLAB", "COLAB_ENTERPRISE"):
+
+    elif env == "COLAB":
         _set_adc_from_path(config.get("GCP_json_keyfile_colab"))
-    elif env == "GCP":
-        sa_secret_id = config.get("GCP_json_keyfile_GCP_secret_id")
-        if sa_secret_id:  # Opcional: usar SA desde Secret Manager
-            tmp_sa_path = _bootstrap_sa_from_secret_id(sa_secret_id, project_id)
+
+    elif env in ("COLAB_ENTERPRISE", "GCP"):
+        # 1) Preferir ADC nativo (Workload Identity / VM con permisos)
+        if _adc_available():
+            _log("[AUTHENTICATION [SUCCESS ✅]] ADC detectado en COLAB_ENTERPRISE/GCP (no se requiere JSON).")
+        # 2) Si no hay ADC, intentar SA desde Secret Manager (si se proporcionó)
+        elif config.get("GCP_json_keyfile_GCP_secret_id"):
+            tmp_sa_path = _bootstrap_sa_from_secret_id(config["GCP_json_keyfile_GCP_secret_id"], project_id)
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_sa_path
             _log(f"[AUTHENTICATION [SUCCESS ✅]] ADC configurado desde secreto → {tmp_sa_path}")
+        # 3) Último recurso: usar la ruta de Colab si existe
+        elif config.get("GCP_json_keyfile_colab") and os.path.exists(config["GCP_json_keyfile_colab"]):
+            _set_adc_from_path(config["GCP_json_keyfile_colab"])
         else:
-            _log("[AUTHENTICATION [INFO] ℹ️] Usando ADC del entorno GCP (sin ruta explícita).")
+            raise ValueError(
+                "[VALIDATION [ERROR ❌]] No hay credenciales disponibles en COLAB_ENTERPRISE/GCP.\n"
+                "- Opción A: Habilita ADC (Workload Identity / VM con permisos).\n"
+                "- Opción B: Proporciona 'GCP_json_keyfile_GCP_secret_id' con el JSON de SA en Secret Manager.\n"
+                "- Opción C: Aporta una ruta existente en 'GCP_json_keyfile_colab'."
+            )
     else:
         _log(f"[AUTHENTICATION [WARNING ⚠️]] Entorno '{env}' no reconocido. Intentando ADC por defecto…")
 
-    # Cliente definitivo
+    # ---------------- Cliente definitivo ----------------
     try:
         sm_client = secretmanager.SecretManagerServiceClient()
         _log("[AUTHENTICATION [SUCCESS ✅]] Cliente de Secret Manager listo.")
@@ -470,5 +488,3 @@ def ini_GCP_get_secret_manager(config: dict) -> dict:
 
     _log("[END [FINISHED ✅]]")
     return results
-
-
