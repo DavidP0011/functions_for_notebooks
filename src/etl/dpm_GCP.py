@@ -1,9 +1,9 @@
+
 import pandas as pd
 from common.dpm_GCP_ini import _ini_authenticate_API
 
-
 # __________________________________________________________________________________________________________________________________________________________
-# GBQ_tables_schema_df
+# GBQ_tables_schema_df  (FIX: añade scopes obligatorios y opción de override por config)
 # __________________________________________________________________________________________________________________________________________________________
 def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
     """
@@ -11,71 +11,66 @@ def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
     añadiendo al final las columnas 'fecha_actualizacion_GBQ' (fecha en la que la tabla fue creada o modificada)
     y 'fecha_actualizacion_df' (fecha en la que se creó el DataFrame).
 
-    La autenticación se realiza ahora mediante la función _ini_authenticate_API(), la cual utiliza el valor de
-    'ini_environment_identificated' y las keys de configuración correspondientes ('json_keyfile_colab' para entornos
-    LOCAL/COLAB o 'json_keyfile_GCP_secret_id' para entornos GCP).
+    La autenticación se realiza mediante _ini_authenticate_API(), que ahora recibe explícitamente los SCOPES.
+    Puedes sobreescribirlos pasando 'gcp_scopes_list' en config.
 
     Args:
         config (dict):
-            - project_id (str) [requerido]: El ID del proyecto de BigQuery.
-            - datasets (list) [opcional]: Lista de los IDs de los datasets a consultar. Si no se proporciona,
-              se consultan todos los disponibles en el proyecto.
-            - include_tables (bool) [opcional]: Indica si se deben incluir las tablas en el esquema. Por defecto es True.
-            - ini_environment_identificated (str, requerido): Valor que indica el entorno de ejecución detectado.
-              Puede ser:
-                * 'COLAB' o 'LOCAL' para entornos local/Colab (se usará json_keyfile_colab).
-                * 'COLAB_ENTERPRISE' o el ID del proyecto de GCP para entornos GCP (se usará json_keyfile_GCP_secret_id).
-            - json_keyfile_GCP_secret_id (str, requerido en entornos GCP): Secret ID del JSON de credenciales alojado en Secret Manager.
-            - json_keyfile_colab (str, requerido en entornos local/Colab): Ruta al archivo JSON de credenciales.
+            - project_id (str) [requerido]
+            - datasets (list) [opcional]
+            - include_tables (bool) [opcional] (def. True)
+            - ini_environment_identificated (str) [requerido]
+            - json_keyfile_GCP_secret_id (str) [según entorno]
+            - json_keyfile_colab (str) [según entorno]
+            - gcp_scopes_list (list[str]) [opcional]: scopes a usar en la autenticación
 
     Returns:
-        pd.DataFrame: DataFrame con las columnas:
-            [
-                'project_id',
-                'dataset_id',
-                'table_name',
-                'field_name',
-                'field_type',
-                'num_rows',
-                'num_columns',
-                'size_mb',
-                'fecha_actualizacion_GBQ',
-                'fecha_actualizacion_df'
-            ]
+        pd.DataFrame con columnas:
+            ['project_id','dataset_id','table_name','field_name','field_type',
+             'num_rows','num_columns','size_mb','fecha_actualizacion_GBQ','fecha_actualizacion_df']
 
     Raises:
-        ValueError: Si faltan parámetros obligatorios o se produce un error en la autenticación.
-        RuntimeError: Si ocurre un error durante la extracción o transformación de datos.
+        ValueError  : Validación o autenticación
+        RuntimeError: Errores de extracción/transformación
     """
     import os
-    import json
     from google.cloud import bigquery
     import pandas as pd
 
     print("\n🔹🔹🔹 [START ▶️] Inicio del proceso de extracción del esquema de BigQuery 🔹🔹🔹\n", flush=True)
 
-    # ────────────────────────────── AUTENTICACIÓN CON _ini_authenticate_API() ──────────────────────────────
+    # ────────────────────────────── VALIDACIÓN INICIAL ──────────────────────────────
     ini_env = config.get("ini_environment_identificated")
     if not ini_env:
         raise ValueError("[VALIDATION [ERROR ❌]] Falta la key 'ini_environment_identificated' en config.")
-    
-    project_id_str = config.get('project_id')
+
+    project_id_str = (config.get('project_id') or "").strip()
     if not project_id_str:
         raise ValueError("[VALIDATION [ERROR ❌]] El 'project_id' es un argumento requerido en la configuración.")
     print(f"[METRICS [INFO ℹ️]] Proyecto de BigQuery: {project_id_str}", flush=True)
-    
+
+    # ────────────────────────────── SCOPES (FIX PRINCIPAL) ──────────────────────────────
+    scopes_list = config.get(
+        "gcp_scopes_list",
+        [
+            "https://www.googleapis.com/auth/bigquery",
+            "https://www.googleapis.com/auth/drive",  # útil si accedes a BQ con export/import vía Drive
+        ],
+    )
+
+    # ────────────────────────────── AUTENTICACIÓN ──────────────────────────────
     print("[AUTHENTICATION [START ▶️]] Iniciando autenticación utilizando _ini_authenticate_API()...", flush=True)
     try:
-        creds = _ini_authenticate_API(config, project_id_str)
+        creds = _ini_authenticate_API(config, project_id_str, scopes_list)
         print("[AUTHENTICATION [SUCCESS ✅]] Autenticación completada.", flush=True)
     except Exception as e:
         raise ValueError(f"[AUTHENTICATION [ERROR ❌]] Error durante la autenticación: {e}")
 
     # ────────────────────────────── PARÁMETROS DE CONSULTA ──────────────────────────────
     datasets_incluidos_list = config.get('datasets', None)
-    include_tables_bool = config.get('include_tables', True)
+    include_tables_bool = bool(config.get('include_tables', True))
 
-    # ────────────────────────────── INICIALIZACIÓN DEL CLIENTE BIGQUERY ──────────────────────────────
+    # ────────────────────────────── CLIENTE BIGQUERY ──────────────────────────────
     print("[START ▶️] Inicializando cliente de BigQuery...", flush=True)
     try:
         client = bigquery.Client(project=project_id_str, credentials=creds)
@@ -95,7 +90,7 @@ def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Error al obtener los datasets: {e}")
 
-    # ────────────────────────────── RECOPILACIÓN DE INFORMACIÓN DE TABLAS Y CAMPOS ──────────────────────────────
+    # ────────────────────────────── TABLAS Y CAMPOS ──────────────────────────────
     tables_info_list = []
     for dataset in datasets:
         dataset_id_str = dataset.dataset_id
@@ -117,15 +112,15 @@ def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
                     num_rows_int = table_ref.num_rows
                     num_columns_int = len(table_ref.schema)
                     size_mb_float = table_ref.num_bytes / (1024 * 1024)
-                    
-                    # Se obtiene la fecha de actualización: se prefiere 'created', si no se encuentra se utiliza 'modified'
+
+                    # fecha actualización (created o modified)
                     fecha_actualizacion_GBQ_str = None
                     if hasattr(table_ref, 'created') and table_ref.created:
                         fecha_actualizacion_GBQ_str = table_ref.created.strftime("%Y-%m-%d %H:%M:%S")
                     elif hasattr(table_ref, 'modified') and table_ref.modified:
                         fecha_actualizacion_GBQ_str = table_ref.modified.strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    print(f"[METRICS [INFO ℹ️]] Procesando tabla: {table_name_str} | Filas: {num_rows_int} | Columnas: {num_columns_int} | Tamaño: {round(size_mb_float,2)} MB", flush=True)
+
+                    print(f"[METRICS [INFO ℹ️]] Tabla: {table_name_str} | Filas: {num_rows_int} | Cols: {num_columns_int} | Tamaño: {round(size_mb_float,2)} MB", flush=True)
                     if table_ref.schema:
                         for field in table_ref.schema:
                             tables_info_list.append({
@@ -167,7 +162,7 @@ def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
                 'fecha_actualizacion_GBQ': None
             })
 
-    # ────────────────────────────── CONVERSIÓN A DATAFRAME ──────────────────────────────
+    # ────────────────────────────── DATAFRAME ──────────────────────────────
     print("\n[TRANSFORMATION [START ▶️]] Convirtiendo información recopilada a DataFrame...", flush=True)
     try:
         df_tables_fields = pd.DataFrame(tables_info_list)
@@ -175,7 +170,7 @@ def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"[TRANSFORMATION [ERROR ❌]] Error al convertir la información a DataFrame: {e}")
 
-    # Se añade la fecha de creación del DataFrame (constante para todas las filas)
+    # fecha de creación del DataFrame
     df_tables_fields["fecha_actualizacion_df"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("\n🔹🔹🔹 [END [FINISHED ✅]] Esquema de BigQuery extraído y procesado correctamente. 🔹🔹🔹\n", flush=True)
@@ -194,95 +189,69 @@ def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
 
 
 
+
+import pandas as pd
+from common.dpm_GCP_ini import _ini_authenticate_API
+
 # __________________________________________________________________________________________________________________________________________________________
-# GCS_tables_schema_df
+# GCS_objects_schema_df  (FIX: añade scopes obligatorios y opción de override por config)
 # __________________________________________________________________________________________________________________________________________________________
-def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
+def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
     """
-    Retorna un DataFrame con información detallada de:
-      - Buckets de Google Cloud Storage (GCS)
-      - Objetos (archivos) de cada bucket (si `include_objects` es True)
+    Retorna un DataFrame con información de:
+      - Buckets de GCS (propiedades clave)
+      - Objetos/blobs de cada bucket si `include_objects` es True
 
-    Se incluyen, entre otras, las siguientes propiedades a nivel de bucket:
-      - fecha_creacion_bucket
-      - tipo_ubicacion (REGIONAL, MULTI_REGIONAL, etc.)
-      - ubicacion (p.e. us-central1, EU, etc.)
-      - clase_almacenamiento_predeterminada
-      - fecha_ultima_modificacion_bucket
-      - acceso_publico (bool)
-      - control_acceso (IAM vs. ACL, usando uniform bucket-level access)
-      - proteccion (public_access_prevention, versioning, etc.)
-      - espacio_nombres_jerarquico (referencia, en GCS no hay verdadero árbol)
-      - retencion_buckets (retention_period, en segundos)
-      - reglas_ciclo_vida (lifecycle_rules)
-      - etiquetas (labels)
-      - pagos_solicitante (requester_pays)
-      - replicacion (rpo, para dual-region)
-      - encriptacion (default_kms_key_name o "Google-managed")
-      - estadisticas_seguridad (placeholder)
-
-    Y a nivel de objeto:
-      - object_name
-      - content_type
-      - size_mb
-      - fecha_actualizacion_GCS (time_created o updated)
-      - etc.
-
-    Se añade 'fecha_actualizacion_df' (fecha en la que se creó el DataFrame) para todas las filas.
-
-    La autenticación se realiza mediante _ini_authenticate_API(), utilizando el valor de
-    'ini_environment_identificated' y las keys correspondientes ('json_keyfile_colab' o 'json_keyfile_GCP_secret_id').
+    Autenticación mediante _ini_authenticate_API(), ahora con SCOPES explícitos.
+    Puedes sobreescribirlos con `config['gcp_scopes_list']`.
 
     Args:
         config (dict):
-            - project_id (str) [requerido]: ID del proyecto de GCP.
-            - buckets (list) [opcional]: Nombres de los buckets a consultar. Si no se proporciona,
-              se listan todos los buckets disponibles en el proyecto.
-            - include_objects (bool) [opcional]: Si True, detalla también los objetos en cada bucket. Por defecto True.
-            - ini_environment_identificated (str, requerido): Valor que indica el entorno de ejecución detectado.
-              Puede ser:
-                * 'COLAB' o 'LOCAL' para entornos local/Colab (se usará json_keyfile_colab).
-                * 'COLAB_ENTERPRISE' o el ID del proyecto de GCP para entornos GCP (se usará json_keyfile_GCP_secret_id).
-            - json_keyfile_GCP_secret_id (str, requerido en entornos GCP): ID del secreto en Secret Manager que contiene las credenciales.
-            - json_keyfile_colab (str, requerido en entornos local/Colab): Ruta local al JSON de credenciales.
+          - project_id (str) [requerido]
+          - buckets (list[str]) [opcional]
+          - include_objects (bool) [opcional] (def. True)
+          - ini_environment_identificated (str) [requerido]
+          - json_keyfile_GCP_secret_id / json_keyfile_colab / json_keyfile_local [según entorno]
+          - gcp_scopes_list (list[str]) [opcional] → scopes a usar (def. devstorage.read_only)
 
     Returns:
-        pd.DataFrame:
-            DataFrame con columnas a nivel de bucket y, si procede, de objetos.
-
-    Raises:
-        ValueError: Si faltan parámetros obligatorios o se produce un error en la autenticación.
-        RuntimeError: Si ocurre algún problema durante la extracción o transformación.
+        pd.DataFrame con columnas a nivel bucket y, si procede, a nivel objeto.
     """
     import os
-    import json
     import pandas as pd
     from google.cloud import storage
 
     print("\n🔹🔹🔹 [START ▶️] Inicio del proceso de extracción extendida de GCS 🔹🔹🔹\n", flush=True)
 
-    # ────────────────────────────── AUTENTICACIÓN CON _ini_authenticate_API() ──────────────────────────────
+    # ────────────────────────────── VALIDACIÓN ──────────────────────────────
     ini_env = config.get("ini_environment_identificated")
     if not ini_env:
         raise ValueError("[VALIDATION [ERROR ❌]] Falta la key 'ini_environment_identificated' en config.")
-    
-    project_id_str = config.get('project_id')
+
+    project_id_str = (config.get('project_id') or "").strip()
     if not project_id_str:
         raise ValueError("[VALIDATION [ERROR ❌]] 'project_id' es obligatorio en la configuración.")
     print(f"[METRICS [INFO ℹ️]] Proyecto de GCP: {project_id_str}", flush=True)
-    
+
+    # ────────────────────────────── SCOPES (FIX) ──────────────────────────────
+    scopes_list = config.get(
+        "gcp_scopes_list",
+        ["https://www.googleapis.com/auth/devstorage.read_only"]  # lectura de buckets/objetos
+    )
+
+    # ────────────────────────────── AUTENTICACIÓN ──────────────────────────────
     print("[AUTHENTICATION [START ▶️]] Iniciando autenticación utilizando _ini_authenticate_API()...", flush=True)
     try:
-        creds = _ini_authenticate_API(config, project_id_str)
+        creds = _ini_authenticate_API(config, project_id_str, scopes_list)
         print("[AUTHENTICATION [SUCCESS ✅]] Autenticación completada.", flush=True)
     except Exception as e:
         raise ValueError(f"[AUTHENTICATION [ERROR ❌]] Error durante la autenticación: {e}")
 
-    # ────────────────────────────── PARÁMETROS DE CONSULTA ──────────────────────────────
+    # ────────────────────────────── PARÁMETROS ──────────────────────────────
     buckets_incluidos_list = config.get('buckets', None)
-    include_objects_bool = config.get('include_objects', True)
+    include_objects_bool = bool(config.get('include_objects', True))
 
-    # ────────────────────────────── CLIENTE DE STORAGE ──────────────────────────────
+    # ────────────────────────────── CLIENTE STORAGE ──────────────────────────────
     print("[START ▶️] Inicializando cliente de Google Cloud Storage...", flush=True)
     try:
         storage_client = storage.Client(project=project_id_str, credentials=creds)
@@ -290,7 +259,7 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"[LOAD [ERROR ❌]] Error al inicializar el cliente de GCS: {e}")
 
-    # ────────────────────────────── OBTENCIÓN DE BUCKETS ──────────────────────────────
+    # ────────────────────────────── OBTENER BUCKETS ──────────────────────────────
     print("[EXTRACTION [START ▶️]] Obteniendo buckets del proyecto...", flush=True)
     try:
         if buckets_incluidos_list:
@@ -302,11 +271,10 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Error al obtener los buckets: {e}")
 
-    # ────────────────────────────── Helper: verificar acceso público ──────────────────────────────
+    # ────────────────────────────── Helper: acceso público ──────────────────────────────
     def _is_public(bucket_obj):
         """
-        Retorna True si el bucket permite acceso anónimo o allAuthenticatedUsers
-        mediante IAM. Requiere permiso storage.buckets.getIamPolicy.
+        Retorna True si el bucket permite acceso anónimo o allAuthenticatedUsers por IAM.
         """
         try:
             policy = bucket_obj.get_iam_policy(requested_policy_version=3)
@@ -318,12 +286,12 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
                 return True
         return False
 
-    # ────────────────────────────── RECOPILACIÓN DE INFORMACIÓN ──────────────────────────────
+    # ────────────────────────────── RECOPILACIÓN ──────────────────────────────
     gcs_info_list = []
     for bucket_obj in buckets:
         bucket_name_str = bucket_obj.name
 
-        # Forzar la carga de propiedades del bucket (si no se han cargado)
+        # Asegurar propiedades cargadas
         try:
             bucket_obj.reload()
         except Exception as e:
@@ -354,7 +322,7 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
         encriptacion_str = bucket_obj.default_kms_key_name or "Google-managed"
         estadisticas_seguridad_str = None
 
-        # ────────── Si include_objects es True, se listan también los objetos del bucket ──────────
+        # Listado de objetos opcional
         if include_objects_bool:
             print(f"\n[EXTRACTION [INFO ℹ️]] Listando objetos en bucket '{bucket_name_str}'...", flush=True)
             try:
@@ -391,7 +359,7 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
             for blob in blobs:
                 object_name_str = blob.name
                 content_type_str = blob.content_type
-                size_mb_float = round(blob.size / (1024 * 1024), 2) if blob.size else 0.0
+                size_mb_float = round((blob.size or 0) / (1024 * 1024), 2)
                 time_created_obj = blob.time_created
                 updated_obj = blob.updated
                 if time_created_obj:
@@ -426,7 +394,7 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
                     'fecha_actualizacion_GCS': fecha_actualizacion_GCS_str
                 })
         else:
-            # Si no se incluyen objetos, se registra una sola fila por bucket
+            # sin objetos: 1 fila por bucket
             gcs_info_list.append({
                 'project_id': project_id_str,
                 'bucket_name': bucket_name_str,
@@ -452,7 +420,7 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
                 'fecha_actualizacion_GCS': None
             })
 
-    # ────────────────────────────── CONVERSIÓN A DATAFRAME ──────────────────────────────
+    # ────────────────────────────── DATAFRAME ──────────────────────────────
     print("\n[TRANSFORMATION [START ▶️]] Convirtiendo información recopilada en DataFrame...", flush=True)
     try:
         df_gcs = pd.DataFrame(gcs_info_list)
@@ -460,10 +428,8 @@ def GCS_tables_schema_df(config: dict) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"[TRANSFORMATION [ERROR ❌]] Error al convertir la información a DataFrame: {e}")
 
-    # Añadir la fecha de creación del DataFrame a todas las filas
+    # Marca temporal de creación del DF
     df_gcs["fecha_actualizacion_df"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("\n🔹🔹🔹 [END [FINISHED ✅]] Esquema extendido de GCS obtenido correctamente. 🔹🔹🔹\n", flush=True)
     return df_gcs
-
-
