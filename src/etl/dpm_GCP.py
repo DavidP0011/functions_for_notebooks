@@ -190,41 +190,44 @@ def GBQ_tables_schema_df(config: dict) -> pd.DataFrame:
 
 
 
+import copy
 import pandas as pd
 from common.dpm_GCP_ini import _ini_authenticate_API
 
 # __________________________________________________________________________________________________________________________________________________________
-# GCS_objects_schema_df  (FIX: añade scopes obligatorios y opción de override por config)
+# GCS_objects_schema_df (antes GCS_tables_schema_df)
+# Evita el intento de Secret Manager en entornos sin ADC, sin modificar _ini_authenticate_API()
 # __________________________________________________________________________________________________________________________________________________________
 def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
     """
-    Retorna un DataFrame con información de:
-      - Buckets de GCS (propiedades clave)
-      - Objetos/blobs de cada bucket si `include_objects` es True
+    Extrae metadatos de GCS a nivel de bucket y, opcionalmente, a nivel de objeto (blob).
 
-    Autenticación mediante _ini_authenticate_API(), ahora con SCOPES explícitos.
-    Puedes sobreescribirlos con `config['gcp_scopes_list']`.
+    Estrategia para evitar excepciones/timeout:
+    - Se hace una copia de 'config' y, si NO hay ADC disponible (p.ej. Colab/Local),
+      se limpia 'json_keyfile_GCP_secret_id' en esa copia, forzando a _ini_authenticate_API()
+      a usar keyfile directamente y evitando el intento de Secret Manager.
 
     Args:
         config (dict):
-          - project_id (str) [requerido]
+          - project_id (str) [obligatorio]
           - buckets (list[str]) [opcional]
           - include_objects (bool) [opcional] (def. True)
-          - ini_environment_identificated (str) [requerido]
-          - json_keyfile_GCP_secret_id / json_keyfile_colab / json_keyfile_local [según entorno]
+          - ini_environment_identificated (str) [obligatorio]
+          - json_keyfile_local / json_keyfile_colab / json_keyfile_GCP_secret_id [según entorno]
           - gcp_scopes_list (list[str]) [opcional] → scopes a usar (def. devstorage.read_only)
 
     Returns:
-        pd.DataFrame con columnas a nivel bucket y, si procede, a nivel objeto.
+        pd.DataFrame: metadatos de buckets y objetos.
     """
     import os
-    import pandas as pd
     from google.cloud import storage
+    from google.auth import default as default_auth
+    from google.auth.transport.requests import Request
 
     print("\n🔹🔹🔹 [START ▶️] Inicio del proceso de extracción extendida de GCS 🔹🔹🔹\n", flush=True)
 
     # ────────────────────────────── VALIDACIÓN ──────────────────────────────
-    ini_env = config.get("ini_environment_identificated")
+    ini_env = (config.get("ini_environment_identificated") or "").strip()
     if not ini_env:
         raise ValueError("[VALIDATION [ERROR ❌]] Falta la key 'ini_environment_identificated' en config.")
 
@@ -233,23 +236,44 @@ def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
         raise ValueError("[VALIDATION [ERROR ❌]] 'project_id' es obligatorio en la configuración.")
     print(f"[METRICS [INFO ℹ️]] Proyecto de GCP: {project_id_str}", flush=True)
 
-    # ────────────────────────────── SCOPES (FIX) ──────────────────────────────
+    # ────────────────────────────── SCOPES ──────────────────────────────
     scopes_list = config.get(
         "gcp_scopes_list",
-        ["https://www.googleapis.com/auth/devstorage.read_only"]  # lectura de buckets/objetos
+        ["https://www.googleapis.com/auth/devstorage.read_only"]
     )
+
+    # ────────────────────────────── DETECCIÓN ADC ──────────────────────────────
+    def _adc_available() -> bool:
+        try:
+            creds, _ = default_auth(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            if getattr(creds, "requires_scopes", False):
+                creds = creds.with_scopes(["https://www.googleapis.com/auth/cloud-platform"])
+            # refresh rápido para validar token/metadata server
+            creds.refresh(Request())
+            return True
+        except Exception:
+            return False
+
+    # Copia defensiva del config para no mutar el original del usuario
+    safe_config = copy.deepcopy(config)
+
+    # Si NO hay ADC (típico en COLAB/LOCAL), limpiamos el secret_id para evitar SM y gRPC noise
+    if not _adc_available() and (ini_env.upper() in {"LOCAL", "COLAB"}):
+        if safe_config.get("json_keyfile_GCP_secret_id"):
+            print("[AUTHENTICATION [INFO ℹ️]] ADC no disponible en este entorno; se omite Secret Manager y se forzará keyfile.", flush=True)
+        safe_config["json_keyfile_GCP_secret_id"] = ""  # ← clave del truco
 
     # ────────────────────────────── AUTENTICACIÓN ──────────────────────────────
     print("[AUTHENTICATION [START ▶️]] Iniciando autenticación utilizando _ini_authenticate_API()...", flush=True)
     try:
-        creds = _ini_authenticate_API(config, project_id_str, scopes_list)
+        creds = _ini_authenticate_API(safe_config, project_id_str, scopes_list)
         print("[AUTHENTICATION [SUCCESS ✅]] Autenticación completada.", flush=True)
     except Exception as e:
         raise ValueError(f"[AUTHENTICATION [ERROR ❌]] Error durante la autenticación: {e}")
 
     # ────────────────────────────── PARÁMETROS ──────────────────────────────
-    buckets_incluidos_list = config.get('buckets', None)
-    include_objects_bool = bool(config.get('include_objects', True))
+    buckets_incluidos_list = safe_config.get('buckets') or None
+    include_objects_bool = bool(safe_config.get('include_objects', True))
 
     # ────────────────────────────── CLIENTE STORAGE ──────────────────────────────
     print("[START ▶️] Inicializando cliente de Google Cloud Storage...", flush=True)
@@ -273,16 +297,12 @@ def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
 
     # ────────────────────────────── Helper: acceso público ──────────────────────────────
     def _is_public(bucket_obj):
-        """
-        Retorna True si el bucket permite acceso anónimo o allAuthenticatedUsers por IAM.
-        """
         try:
             policy = bucket_obj.get_iam_policy(requested_policy_version=3)
         except Exception:
             return None
         for binding in policy.bindings:
-            members = binding.get("members", [])
-            if "allUsers" in members or "allAuthenticatedUsers" in members:
+            if "allUsers" in binding.get("members", []) or "allAuthenticatedUsers" in binding.get("members", []):
                 return True
         return False
 
@@ -291,38 +311,30 @@ def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
     for bucket_obj in buckets:
         bucket_name_str = bucket_obj.name
 
-        # Asegurar propiedades cargadas
         try:
             bucket_obj.reload()
         except Exception as e:
-            print(f"[EXTRACTION [WARN ⚠️]] No se pudieron recargar propiedades para el bucket '{bucket_name_str}': {e}", flush=True)
+            print(f"[EXTRACTION [WARNING ⚠️]] No se pudieron recargar propiedades para '{bucket_name_str}': {e}", flush=True)
 
-        bucket_props = bucket_obj._properties
-        time_created_bucket = bucket_obj.time_created
-        fecha_creacion_bucket_str = (time_created_bucket.strftime("%Y-%m-%d %H:%M:%S")
-                                     if time_created_bucket else None)
-        updated_str = bucket_props.get("updated")
-        fecha_ultima_modificacion_bucket_str = updated_str
-        tipo_ubicacion = bucket_props.get("locationType")
+        bp = bucket_obj._properties  # dict crudo
+        fecha_creacion_bucket_str = bucket_obj.time_created.strftime("%Y-%m-%d %H:%M:%S") if bucket_obj.time_created else None
+        fecha_ultima_modificacion_bucket_str = bp.get("updated")
+        tipo_ubicacion = bp.get("locationType")
         ubicacion = bucket_obj.location
         clase_almacenamiento = bucket_obj.storage_class
         acceso_publico_bool = _is_public(bucket_obj)
-        ubla_conf = bucket_obj.iam_configuration.get("uniformBucketLevelAccess", {})
-        is_ubla_enabled = ubla_conf.get("enabled", False)
-        control_acceso_str = "UNIFORM" if is_ubla_enabled else "FINE"
+        ubla = bucket_obj.iam_configuration.get("uniformBucketLevelAccess", {})
+        control_acceso_str = "UNIFORM" if ubla.get("enabled", False) else "FINE"
         public_access_prevention = bucket_obj.iam_configuration.get("publicAccessPrevention")
         versioning_enabled = bucket_obj.versioning_enabled
         proteccion_str = f"publicAccessPrevention={public_access_prevention}, versioning={versioning_enabled}"
-        espacio_nombres_jerarquico = "No hay jerarquía real en GCS"
         retencion_seg = bucket_obj.retention_period
         reglas_ciclo_vida = bucket_obj.lifecycle_rules
         etiquetas_dict = bucket_obj.labels
         pagos_solicitante_bool = bucket_obj.requester_pays
         replication_rpo = bucket_obj.rpo
         encriptacion_str = bucket_obj.default_kms_key_name or "Google-managed"
-        estadisticas_seguridad_str = None
 
-        # Listado de objetos opcional
         if include_objects_bool:
             print(f"\n[EXTRACTION [INFO ℹ️]] Listando objetos en bucket '{bucket_name_str}'...", flush=True)
             try:
@@ -330,42 +342,14 @@ def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
                 print(f"[EXTRACTION [SUCCESS ✅]] Se encontraron {len(blobs)} objetos en '{bucket_name_str}'.", flush=True)
             except Exception as e:
                 print(f"[EXTRACTION [ERROR ❌]] Error al listar objetos en '{bucket_name_str}': {e}", flush=True)
-                gcs_info_list.append({
-                    'project_id': project_id_str,
-                    'bucket_name': bucket_name_str,
-                    'fecha_creacion_bucket': fecha_creacion_bucket_str,
-                    'tipo_ubicacion': tipo_ubicacion,
-                    'ubicacion': ubicacion,
-                    'clase_almacenamiento_predeterminada': clase_almacenamiento,
-                    'fecha_ultima_modificacion_bucket': fecha_ultima_modificacion_bucket_str,
-                    'acceso_publico': acceso_publico_bool,
-                    'control_acceso': control_acceso_str,
-                    'proteccion': proteccion_str,
-                    'espacio_nombres_jerarquico': espacio_nombres_jerarquico,
-                    'retencion_buckets': retencion_seg,
-                    'reglas_ciclo_vida': str(reglas_ciclo_vida) if reglas_ciclo_vida else None,
-                    'etiquetas': str(etiquetas_dict) if etiquetas_dict else None,
-                    'pagos_solicitante': pagos_solicitante_bool,
-                    'replicacion': replication_rpo,
-                    'encriptacion': encriptacion_str,
-                    'estadisticas_seguridad': estadisticas_seguridad_str,
-                    'object_name': None,
-                    'content_type': None,
-                    'size_mb': None,
-                    'fecha_actualizacion_GCS': None
-                })
-                continue
+                blobs = []
 
             for blob in blobs:
-                object_name_str = blob.name
-                content_type_str = blob.content_type
                 size_mb_float = round((blob.size or 0) / (1024 * 1024), 2)
-                time_created_obj = blob.time_created
-                updated_obj = blob.updated
-                if time_created_obj:
-                    fecha_actualizacion_GCS_str = time_created_obj.strftime("%Y-%m-%d %H:%M:%S")
-                elif updated_obj:
-                    fecha_actualizacion_GCS_str = updated_obj.strftime("%Y-%m-%d %H:%M:%S")
+                if blob.time_created:
+                    fecha_actualizacion_GCS_str = blob.time_created.strftime("%Y-%m-%d %H:%M:%S")
+                elif blob.updated:
+                    fecha_actualizacion_GCS_str = blob.updated.strftime("%Y-%m-%d %H:%M:%S")
                 else:
                     fecha_actualizacion_GCS_str = None
 
@@ -380,21 +364,18 @@ def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
                     'acceso_publico': acceso_publico_bool,
                     'control_acceso': control_acceso_str,
                     'proteccion': proteccion_str,
-                    'espacio_nombres_jerarquico': espacio_nombres_jerarquico,
                     'retencion_buckets': retencion_seg,
                     'reglas_ciclo_vida': str(reglas_ciclo_vida) if reglas_ciclo_vida else None,
                     'etiquetas': str(etiquetas_dict) if etiquetas_dict else None,
                     'pagos_solicitante': pagos_solicitante_bool,
                     'replicacion': replication_rpo,
                     'encriptacion': encriptacion_str,
-                    'estadisticas_seguridad': estadisticas_seguridad_str,
-                    'object_name': object_name_str,
-                    'content_type': content_type_str,
+                    'object_name': blob.name,
+                    'content_type': blob.content_type,
                     'size_mb': size_mb_float,
-                    'fecha_actualizacion_GCS': fecha_actualizacion_GCS_str
+                    'fecha_actualizacion_GCS': fecha_actualizacion_GCS_str,
                 })
         else:
-            # sin objetos: 1 fila por bucket
             gcs_info_list.append({
                 'project_id': project_id_str,
                 'bucket_name': bucket_name_str,
@@ -406,18 +387,16 @@ def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
                 'acceso_publico': acceso_publico_bool,
                 'control_acceso': control_acceso_str,
                 'proteccion': proteccion_str,
-                'espacio_nombres_jerarquico': espacio_nombres_jerarquico,
                 'retencion_buckets': retencion_seg,
                 'reglas_ciclo_vida': str(reglas_ciclo_vida) if reglas_ciclo_vida else None,
                 'etiquetas': str(etiquetas_dict) if etiquetas_dict else None,
                 'pagos_solicitante': pagos_solicitante_bool,
                 'replicacion': replication_rpo,
                 'encriptacion': encriptacion_str,
-                'estadisticas_seguridad': estadisticas_seguridad_str,
                 'object_name': None,
                 'content_type': None,
                 'size_mb': None,
-                'fecha_actualizacion_GCS': None
+                'fecha_actualizacion_GCS': None,
             })
 
     # ────────────────────────────── DATAFRAME ──────────────────────────────
@@ -428,8 +407,7 @@ def GCS_objects_schema_df(config: dict) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"[TRANSFORMATION [ERROR ❌]] Error al convertir la información a DataFrame: {e}")
 
-    # Marca temporal de creación del DF
     df_gcs["fecha_actualizacion_df"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-
     print("\n🔹🔹🔹 [END [FINISHED ✅]] Esquema extendido de GCS obtenido correctamente. 🔹🔹🔹\n", flush=True)
     return df_gcs
+
