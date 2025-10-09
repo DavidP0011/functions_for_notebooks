@@ -488,200 +488,315 @@ def SQL_generate_cleaning_str(params: dict) -> str:
 
 
 # __________________________________________________________________________________________________________________________________________________________
+# SQL_generate_country_from_phone()
+# __________________________________________________________________________________________________________________________________________________________
+
 def SQL_generate_country_from_phone(config: dict) -> str:
     """
-    Genera un script SQL para actualizar una tabla destino a partir de datos extraídos de números telefónicos y estatus de llamadas.
-    Se procesa el número (añadiendo un prefijo si es necesario y determinando el país) y se extraen los estatus de llamadas para realizar un JOIN con la tabla destino.
+    Genera un script SQL para actualizar una tabla destino a partir del país
+    detectado en números telefónicos y del último estatus de llamada por contacto.
+    Lee contactos y llamadas desde BigQuery, sube una tabla auxiliar a GBQ y
+    devuelve el SQL final (incluye DROP opcional de la tabla temporal).
 
-    Parámetros en config:
-      - source_table (str): Tabla de contactos en formato "proyecto.dataset.tabla".
-      - source_contact_phone_field (str): Campo que contiene el número telefónico.
-      - source_contact_id_field_name (str): Campo identificador del contacto.
-      
-      - source_engagement_call_table (str): Tabla de llamadas en formato "proyecto.dataset.tabla".
-      - source_engagement_call_id_match_contact_field_name (str): Campo para relacionar llamadas y contactos.
-      - source_engagement_call_status_field_name (str): Nombre original del campo de estatus de llamada.
-      - source_engagement_call_status_values_list (list): Lista de estatus permitidos (ej.: ['COMPLETED', 'IN_PROGRESS', 'QUEUED']).
-      - source_engagement_createdate_field_name (str): Nombre original del campo de fecha de creación de la llamada.
-      
-      - target_table (str): Tabla destino en formato "proyecto.dataset.tabla".
-      - target_id_match_contact_field_name (str): Campo en la tabla destino para hacer match con el contacto.
-      - target_country_mapped_field_name (str): Campo donde se almacenará el país obtenido.
-      - target_call_status_field_name (str): Campo donde se almacenará el estatus de la llamada. Si está vacío, no se crea.
-      
-      - temp_table_name (str): Nombre de la tabla auxiliar.
-      - temp_table_erase (bool): Si True, se elimina la tabla auxiliar tras el JOIN.
-      
-      - Además, se deben incluir las claves de autenticación:
-        - ini_environment_identificated
-        - json_keyfile_local
-        - json_keyfile_colab
-        - json_keyfile_GCP_secret_id
+    Parámetros en config (dict):
+      # Origen contactos
+      - source_table (str)                                         proyecto.dataset.tabla
+      - source_contact_phone_field (str)                           campo teléfono en source_table
+      - source_contact_id_field_name (str)                         id del contacto en source_table
+
+      # Origen llamadas
+      - source_engagement_call_table (str)                         proyecto.dataset.tabla
+      - source_engagement_call_id_match_contact_field_name (str)   campo en llamadas para vincular al id de contacto
+      - source_engagement_call_status_field_name (str)             campo de estatus de llamada
+      - source_engagement_call_status_values_list (list[str])      estatus permitidos (p.ej. ['COMPLETED', 'IN_PROGRESS'])
+      - source_engagement_createdate_field_name (str)              campo fecha/hora de creación de la llamada
+
+      # Destino/auxiliar
+      - target_table (str)                                         proyecto.dataset.tabla
+      - target_id_match_contact_field_name (str)                   campo en destino para matchear contacto
+      - target_country_mapped_field_name (str)                     campo en destino para volcar país
+      - target_call_status_field_name (str)                        campo opcional en destino para volcar estatus
+      - temp_table_name (str, opc.)                                nombre de tabla auxiliar (default: temp_country_mapping_from_phone)
+      - temp_table_erase (bool, opc.)                              default True
+
+      # Comportamiento
+      - default_phone_prefix (str, opc.)                           default '+34'
+      - contacts_sample_limit (int, opc.)                          limitar contactos para pruebas
+      - location (str, opc.)                                       región BQ (e.g. 'EU'|'US')
+
+      # Autenticación (mismo esquema del proyecto)
+      - json_keyfile_local (str|dict, opc.)
+      - json_keyfile_colab (str|dict, opc.)
+      - json_keyfile_GCP_secret_id (str, opc.)
+      - ini_environment_identificated (str, recomendado)
 
     Retorna:
-        str: Script SQL final (incluye JOIN y, opcionalmente, DROP TABLE).
+      str: Script SQL final que hace CREATE OR REPLACE de la tabla destino + DROP temp (si procede).
+
+    Raises:
+      ValueError | RuntimeError: por validaciones, auth o extracción/carga.
     """
-    print("[START ▶️] Procesando números telefónicos para determinar países...", flush=True)
-    # Importar las librerías necesarias
+    import os
     import math
+    import re
     import pandas as pd
-    import pandas_gbq
+    from typing import Optional, Tuple
     from google.cloud import bigquery
-    
-    # Parámetros de configuración para contactos
-    table_source = config["source_table"]
-    source_phone_field = config["source_contact_phone_field"]
-    source_contact_id = config["source_contact_id_field_name"]
-    
-    # Parámetros de llamadas
-    call_table = config["source_engagement_call_table"]
-    call_match_field = config["source_engagement_call_id_match_contact_field_name"]
-    call_status_field = config["source_engagement_call_status_field_name"]
-    call_status_values_list = config["source_engagement_call_status_values_list"]
-    call_createdate_field = config["source_engagement_createdate_field_name"]
-    
-    # Parámetros de la tabla destino
-    target_table = config["target_table"]
-    target_id_match_field = config["target_id_match_contact_field_name"]
-    target_country_field = config["target_country_mapped_field_name"]
-    target_call_status_field = config["target_call_status_field_name"]
+    from google.oauth2 import service_account
 
-    default_prefix = config.get("default_phone_prefix", "+34")
-    
-    print("[AUTHENTICATION [INFO] ℹ️] Iniciando autenticación...", flush=True)
-    project = table_source.split(".")[0]
-    creds = _ini_authenticate_API(config, project)
-    client = bigquery.Client(project=project, credentials=creds)
-    
-    print("[EXTRACTION START ▶️] Extrayendo datos de contactos...", flush=True)
-    query_source = f"SELECT {source_contact_id}, {source_phone_field} FROM {table_source}"
-    df_contacts = client.query(query_source).to_dataframe()
+    print("[START ▶️] Procesando números telefónicos para determinar países...", flush=True)
+
+    # ───────────────────────────────── Validaciones ─────────────────────────────────
+    def _req(key: str) -> str:
+        if key not in config or config.get(key) in (None, ""):
+            raise ValueError(f"[VALIDATION [ERROR ❌]] Falta parámetro obligatorio: '{key}'.")
+        return config[key]
+
+    table_source                           = _req("source_table")
+    source_phone_field                     = _req("source_contact_phone_field")
+    source_contact_id                      = _req("source_contact_id_field_name")
+
+    call_table                             = _req("source_engagement_call_table")
+    call_match_field                       = _req("source_engagement_call_id_match_contact_field_name")
+    call_status_field                      = _req("source_engagement_call_status_field_name")
+    call_status_values_list                = config.get("source_engagement_call_status_values_list") or []
+    call_createdate_field                  = _req("source_engagement_createdate_field_name")
+
+    target_table                           = _req("target_table")
+    target_id_match_field                  = _req("target_id_match_contact_field_name")
+    target_country_field                   = _req("target_country_mapped_field_name")
+    target_call_status_field               = config.get("target_call_status_field_name", "").strip()
+
+    default_prefix                         = config.get("default_phone_prefix", "+34")
+    temp_table_name                        = config.get("temp_table_name", "temp_country_mapping_from_phone")
+    temp_table_erase                       = bool(config.get("temp_table_erase", True))
+    contacts_sample_limit                  = config.get("contacts_sample_limit")  # None o int
+    location                               = config.get("location")
+
+    # Validación de formato tabla destino
+    def _split_table_name(full: str) -> Tuple[str, str, str]:
+        parts = full.split(".")
+        if len(parts) != 3:
+            raise ValueError("[VALIDATION [ERROR ❌]] Los nombres de tabla deben ser 'proyecto.dataset.tabla'.")
+        return parts[0], parts[1], parts[2]
+
+    src_project, _, _ = _split_table_name(table_source)
+    dest_project, dest_dataset, _ = _split_table_name(target_table)
+    aux_table = f"{dest_project}.{dest_dataset}.{temp_table_name}"
+
+    # ───────────────────────────── Autenticación silenciosa ─────────────────────────
+    def _auth_with_scopes(scopes: list):
+        """
+        Prioriza keyfile (ruta|dict) y evita ruido de metadata/Secret Manager.
+        Si no hay keyfile, cae a _ini_authenticate_API(config, project_id, scopes).
+        """
+        key_local = config.get("json_keyfile_local")
+        key_colab = config.get("json_keyfile_colab")
+        try:
+            if isinstance(key_local, str) and os.path.exists(key_local):
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile: {key_local}", flush=True)
+                return service_account.Credentials.from_service_account_file(key_local, scopes=scopes)
+            if isinstance(key_local, dict) and "client_email" in key_local:
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict local.", flush=True)
+                return service_account.Credentials.from_service_account_info(key_local, scopes=scopes)
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile local no utilizable: {e}", flush=True)
+        try:
+            if isinstance(key_colab, str) and os.path.exists(key_colab):
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile (colab): {key_colab}", flush=True)
+                return service_account.Credentials.from_service_account_file(key_colab, scopes=scopes)
+            if isinstance(key_colab, dict) and "client_email" in key_colab:
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict colab.", flush=True)
+                return service_account.Credentials.from_service_account_info(key_colab, scopes=scopes)
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile colab no utilizable: {e}", flush=True)
+        # Fallback helper del proyecto
+        try:
+            creds = _ini_authenticate_API(config, src_project, scopes)
+            print("[AUTHENTICATION [SUCCESS ✅]] Credenciales obtenidas por helper.", flush=True)
+            return creds
+        except Exception as e:
+            raise RuntimeError(f"[AUTHENTICATION [ERROR ❌]] {e}")
+
+    scopes = ["https://www.googleapis.com/auth/bigquery",
+              "https://www.googleapis.com/auth/drive"]
+    creds = _auth_with_scopes(scopes)
+    client = bigquery.Client(project=src_project, credentials=creds, location=location)
+
+    # ───────────────────────────── Extracción desde BigQuery ────────────────────────
+    print("[EXTRACTION [START ▶️]] Extrayendo datos de contactos...", flush=True)
+    contacts_sql = f"""
+        SELECT {source_contact_id} AS contact_id, {source_phone_field} AS phone
+        FROM `{table_source}`
+        WHERE {source_contact_id} IS NOT NULL
+          AND {source_phone_field} IS NOT NULL
+          AND TRIM(CAST({source_phone_field} AS STRING)) != ''
+    """
+    if contacts_sample_limit:
+        contacts_sql += f"\nLIMIT {int(contacts_sample_limit)}"
+    df_contacts = client.query(contacts_sql).to_dataframe()
     if df_contacts.empty:
-        print("[EXTRACTION [WARNING ⚠️]] No se encontraron datos en la tabla de contactos.", flush=True)
+        print("[EXTRACTION [WARNING ⚠️]] No se encontraron contactos con teléfono.", flush=True)
         return ""
-    df_contacts.rename(columns={source_phone_field: "phone"}, inplace=True)
-    df_contacts = df_contacts[df_contacts["phone"].notna() & (df_contacts["phone"].str.strip() != "")]
-    
-    print("[TRANSFORMATION START ▶️] Procesando teléfonos en lotes...", flush=True)
-    def _preprocess_phone(phone: str, default_prefix: str = default_prefix) -> str:
-        if phone and isinstance(phone, str):
-            phone = phone.strip()
-            if not phone.startswith("+"):
-                phone = default_prefix + phone
-        return phone
 
-    def _get_country_from_phone(phone: str) -> str:
+    # Llamadas (filtrar estatus permitidos si vienen definidos)
+    print("[EXTRACTION [START ▶️]] Extrayendo estatus de llamadas...", flush=True)
+    if call_status_values_list:
+        allowed = ", ".join([f"'{str(v)}'" for v in call_status_values_list])
+        status_filter = f"AND {call_status_field} IN ({allowed})"
+    else:
+        status_filter = ""
+    calls_sql = f"""
+        SELECT
+          {call_match_field} AS contact_id,
+          CAST({call_status_field} AS STRING) AS call_status,
+          {call_createdate_field} AS call_createdate
+        FROM `{call_table}`
+        WHERE {call_match_field} IS NOT NULL
+        {status_filter}
+    """
+    df_calls = client.query(calls_sql).to_dataframe()
+
+    print("[EXTRACTION [SUCCESS ✅]] Datos extraídos: "
+          f"contactos={len(df_contacts)} | llamadas={len(df_calls)}", flush=True)
+
+    # ───────────────────────────── Transformación teléfonos ─────────────────────────
+    print("[TRANSFORMATION [START ▶️]] Procesando teléfonos…", flush=True)
+
+    def _clean_phone_str(x: Optional[str]) -> Optional[str]:
+        if x is None: return None
+        s = str(x).strip()
+        s = re.sub(r'[^\d+]', '', s)   # deja dígitos y '+'
+        return s or None
+
+    def _preprocess_phone(phone: Optional[str], default_prefix: str) -> Optional[str]:
+        if phone is None: return None
+        p = _clean_phone_str(phone)
+        if p is None: return None
+        if not p.startswith("+"):
+            # Quita ceros iniciales típicos antes de aplicar prefijo
+            p = re.sub(r'^0+', '', p)
+            p = default_prefix + p
+        return p
+
+    def _get_country_from_phone(phone: Optional[str]) -> Optional[str]:
+        if phone is None: return None
         try:
             import phonenumbers
-            phone_obj = phonenumbers.parse(phone, None)
-            country_code = phonenumbers.region_code_for_number(phone_obj)
-            if country_code:
-                try:
-                    import pycountry
-                    country_obj = pycountry.countries.get(alpha_2=country_code)
-                    return country_obj.name if country_obj else country_code
-                except Exception:
-                    return country_code
-            return None
+            import pycountry
         except Exception:
+            # Si faltan libs, devolvemos None silenciosamente
             return None
-
-    def _process_phone_numbers(series: pd.Series, batch_size: int = 1000) -> tuple:
-        total = len(series)
-        num_batches = math.ceil(total / batch_size)
-        results = [None] * total
-        error_batches = 0
-        for i in range(num_batches):
-            start = i * batch_size
-            end = min((i+1) * batch_size, total)
-            batch = series.iloc[start:end].copy()
-            try:
-                batch = batch.apply(lambda x: _preprocess_phone(x))
-                results[start:end] = batch.apply(_get_country_from_phone).tolist()
-            except Exception as e:
-                error_batches += 1
-                print(f"[EXTRACTION [ERROR ❌]] Error en el lote {i+1}: {e}", flush=True)
-            print(f"[METRICS [INFO ℹ️]] Lote {i+1}/{num_batches} procesado.", flush=True)
-        return pd.Series(results, index=series.index), num_batches, error_batches
-
-    df_contacts["country_name_iso"], num_batches, error_batches = _process_phone_numbers(df_contacts["phone"], batch_size=1000)
-    
-    print("[EXTRACTION START ▶️] Extrayendo estatus de llamadas...", flush=True)
-    query_calls = (
-        f"SELECT {call_match_field} AS {source_contact_id},\n"
-        f"       {call_status_field} AS call_status,\n"
-        f"       {call_createdate_field} AS call_createdate\n"
-        f"FROM {call_table}\n"
-        f"WHERE {call_match_field} IS NOT NULL"
-    )
-    df_calls = client.query(query_calls).to_dataframe()
-    print("[EXTRACTION SUCCESS ✅] Estatus de llamadas extraídos.", flush=True)
-    
-    mapping_df = pd.merge(
-        df_contacts[[source_contact_id, "phone", "country_name_iso"]],
-        df_calls[[source_contact_id, "call_status", "call_createdate"]],
-        on=source_contact_id, how="left"
-    )
-    mapping_df = mapping_df.dropna(subset=["country_name_iso", "call_status"], how="all")
-    
-    total_reg = len(df_contacts)
-    exitos = df_contacts["country_name_iso"].notna().sum()
-    fallidos = total_reg - exitos
-    print(f"[METRICS [INFO ℹ️]] Estadísticas: Total: {total_reg}, Exitosos: {exitos} ({(exitos/total_reg)*100:.2f}%), Fallidos: {fallidos} ({(fallidos/total_reg)*100:.2f}%)", flush=True)
-    
-    parts = target_table.split(".")
-    if len(parts) != 3:
-        raise ValueError("[VALIDATION [ERROR ❌]] 'target_table' debe ser 'proyecto.dataset.tabla'.")
-    dest_project, dest_dataset, _ = parts
-    temp_table = config.get("temp_table_name", "temp_country_mapping_from_phone")
-    aux_table = f"{dest_project}.{dest_dataset}.{temp_table}"
-    
-    print(f"[LOAD START ▶️] Subiendo tabla auxiliar {aux_table}...", flush=True)
-    pandas_gbq.to_gbq(mapping_df,
-                      destination_table=aux_table,
-                      project_id=dest_project,
-                      if_exists="replace",
-                      credentials=creds)
-    
-    def _build_update_sql(aux_tbl: str, client: bigquery.Client) -> str:
         try:
-            target_tbl_obj = client.get_table(target_table)
-            target_fields = [field.name for field in target_tbl_obj.schema]
+            obj = phonenumbers.parse(phone, None)
+            cc = phonenumbers.region_code_for_number(obj)
+            if not cc: return None
+            ctry = pycountry.countries.get(alpha_2=cc)
+            return (ctry.name if ctry else cc)
         except Exception:
-            target_fields = []
-        
-        if isinstance(call_status_values_list, list):
-            call_status_sql = ", ".join(f"'{status}'" for status in call_status_values_list)
-        else:
-            call_status_sql = call_status_values_list
-        
-        if target_call_status_field.strip() == "":
-            additional_field = f", l.country_name_iso AS {target_country_field}"
-        else:
-            additional_field = f", l.country_name_iso AS {target_country_field}, l.call_status AS {target_call_status_field}"
-        
-        join_sql = (
-            f"CREATE OR REPLACE TABLE {target_table} AS\n"
-            f"WITH latest_calls AS (\n"
-            f"  SELECT *, ROW_NUMBER() OVER (PARTITION BY {source_contact_id} ORDER BY call_createdate DESC) AS rn\n"
-            f"  FROM {aux_tbl}\n"
-            f"  WHERE call_status IN ({call_status_sql})\n"
-            f")\n"
-            f"SELECT d.*{additional_field}\n"
-            f"FROM {target_table} d\n"
-            f"LEFT JOIN latest_calls l\n"
-            f"  ON d.{target_id_match_field} = l.{source_contact_id} AND l.rn = 1;"
-        )
-        drop_sql = ""
-        if config.get("temp_table_erase", True):
-            drop_sql = f"\nDROP TABLE {aux_tbl};"
-        return join_sql + "\n" + drop_sql
+            return None
 
-    sql_script = _build_update_sql(aux_table, client)
+    def _process_phone_series(series: pd.Series, batch_size: int = 2000):
+        total = len(series)
+        batches = math.ceil(total / batch_size)
+        out = [None] * total
+        errors = 0
+        for i in range(batches):
+            s, e = i * batch_size, min((i + 1) * batch_size, total)
+            batch = series.iloc[s:e].map(lambda x: _preprocess_phone(x, default_prefix))
+            try:
+                out[s:e] = batch.map(_get_country_from_phone).tolist()
+            except Exception as ex:
+                errors += 1
+                print(f"[TRANSFORMATION [WARNING ⚠️]] Lote {i+1}/{batches} con errores: {ex}", flush=True)
+            print(f"[METRICS [INFO 📊]] Lote teléfonos procesado: {i+1}/{batches}", flush=True)
+        return pd.Series(out, index=series.index), batches, errors
+
+    df_contacts["phone"] = df_contacts["phone"].map(_clean_phone_str)
+    df_contacts = df_contacts[df_contacts["phone"].notna()]
+    df_contacts["country_name_iso"], n_batches, n_err = _process_phone_series(df_contacts["phone"])
+
+    total_reg   = len(df_contacts)
+    exitos      = int(df_contacts["country_name_iso"].notna().sum())
+    fallidos    = total_reg - exitos
+    ratio       = (exitos / total_reg * 100.0) if total_reg else 0.0
+    print(f"[METRICS [INFO 📊]] Teléfonos: total={total_reg} | ok={exitos} ({ratio:0.2f}%) | fallidos={fallidos} | lotes={n_batches} | errores={n_err}", flush=True)
+
+    # Join preliminar para conformar tabla auxiliar
+    if not df_calls.empty:
+        mapping_df = pd.merge(
+            df_contacts.rename(columns={"contact_id": source_contact_id})[[source_contact_id, "phone", "country_name_iso"]],
+            df_calls.rename(columns={"contact_id": source_contact_id})[[source_contact_id, "call_status", "call_createdate"]],
+            on=source_contact_id, how="left"
+        )
+    else:
+        mapping_df = df_contacts.rename(columns={"contact_id": source_contact_id})
+        mapping_df["call_status"] = None
+        mapping_df["call_createdate"] = None
+
+    # ───────────────────────────── Carga temp a BigQuery ────────────────────────────
+    print(f"[LOAD [START ▶️]] Subiendo tabla auxiliar `{aux_table}`…", flush=True)
+    try:
+        import pandas_gbq
+        pandas_gbq.to_gbq(
+            mapping_df,
+            destination_table=aux_table,
+            project_id=dest_project,
+            if_exists="replace",
+            credentials=creds
+        )
+        print("[LOAD [SUCCESS ✅]] Tabla auxiliar subida correctamente.", flush=True)
+    except Exception as e:
+        raise RuntimeError(f"[LOAD [ERROR ❌]] Error subiendo auxiliar a GBQ: {e}")
+
+    # ───────────────────────────── SQL de actualización destino ─────────────────────
+    def _build_update_sql(aux_tbl: str) -> str:
+        # Lista de estatus válidos en SQL (si vinieron)
+        if call_status_values_list:
+            status_sql = ", ".join(f"'{str(v)}'" for v in call_status_values_list)
+            status_filter_sql = f"WHERE call_status IN ({status_sql})"
+        else:
+            status_filter_sql = ""
+
+        if target_call_status_field:
+            add_fields = (
+                f", l.country_name_iso AS {target_country_field}"
+                f", l.call_status AS {target_call_status_field}"
+            )
+        else:
+            add_fields = f", l.country_name_iso AS {target_country_field}"
+
+        # Tomar la última llamada por contacto (si existe)
+        sql = f"""
+CREATE OR REPLACE TABLE `{target_table}` AS
+WITH latest_calls AS (
+  SELECT
+    {source_contact_id},
+    country_name_iso,
+    call_status,
+    call_createdate,
+    ROW_NUMBER() OVER (PARTITION BY {source_contact_id} ORDER BY call_createdate DESC) AS rn
+  FROM `{aux_tbl}`
+  {status_filter_sql}
+)
+SELECT d.*{add_fields}
+FROM `{target_table}` d
+LEFT JOIN latest_calls l
+  ON d.{target_id_match_field} = l.{source_contact_id}
+ AND l.rn = 1;
+""".strip()
+
+        if temp_table_erase:
+            sql += f"\nDROP TABLE `{aux_tbl}`;"
+        return sql
+
+    sql_script = _build_update_sql(aux_table)
+
     print("[TRANSFORMATION [SUCCESS ✅]] SQL generado para actualizar la tabla destino.", flush=True)
     print(sql_script, flush=True)
-    print("[END FINISHED ✅] Proceso finalizado.\n", flush=True)
+    print("[END [FINISHED ✅]] Proceso finalizado.\n", flush=True)
     return sql_script
+
 
 
 
