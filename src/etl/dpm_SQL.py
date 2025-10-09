@@ -1246,136 +1246,250 @@ def SQL_generate_deal_ordinal_str(params) -> str:
 
 
 
-
-
 # __________________________________________________________________________________________________________________________________________________________
+# SQL_generate_new_columns_from_mapping
+# __________________________________________________________________________________________________________________________________________________________
+
 def SQL_generate_new_columns_from_mapping(config: dict) -> tuple:
     """
-    Genera un script SQL que agrega nuevas columnas a una tabla de BigQuery a partir de un mapeo definido en un DataFrame de referencia.
+    Agrega nuevas columnas a una tabla de BigQuery a partir de un mapeo definido en un DataFrame de referencia.
     Sube una tabla auxiliar con el mapeo y realiza un JOIN para incorporar las nuevas columnas.
 
-    Parámetros en config:
-      - source_table_to_add_fields (str): Tabla fuente.
-      - source_table_to_add_fields_reference_field_name (str): Campo de unión.
-      - referece_table_for_new_values_df (pd.DataFrame): DataFrame de referencia.
-      - referece_table_for_new_values_field_names_dic (dict): Diccionario de campos a incorporar.
-      - values_non_matched_result (str): Valor para registros sin match.
-      Además, config debe incluir las claves comunes para autenticación.
+    Config esperado (claves principales):
+      - source_table_to_add_fields (str)                         proyecto.dataset.tabla (FUENTE)
+      - source_table_to_add_fields_reference_field_name (str)    campo llave en la tabla fuente (JOIN izquierda)
+
+      - referece_table_for_new_values_df (pd.DataFrame)          DF de referencia (DERECHA)
+      - referece_table_for_new_values_reference_field_name (str) campo llave en el DF de referencia (JOIN derecha)
+      - referece_table_for_new_values_field_names_dic (dict)     {col_ref: True|False} → qué columnas del DF incorporar (True)
+
+      - values_non_matched_result (str, opc.)                    valor para no-matched (default: 'descartado')
+      - temp_table_name (str, opc.)                              default: 'temp_new_columns_mapping'
+      - temp_table_erase (bool, opc.)                            default: True
+      - sample_limit (int, opc.)                                 limitar valores distintos en la fuente (debug)
+      - location (str, opc.)                                     región BQ (e.g. 'EU'|'US')
+
+      Auth:
+      - json_keyfile_local | json_keyfile_colab | json_keyfile_GCP_secret_id | ini_environment_identificated
 
     Retorna:
-        tuple: (sql_script (str), mapping_df (pd.DataFrame))
+      tuple: (sql_script (str), mapping_df (pd.DataFrame))
     """
-    # Importar pandas y re, además de unicodedata para la normalización
+    # ───────── Imports
+    import os, re, unicodedata
     import pandas as pd
-    import pandas_gbq
-    import re
-    import unicodedata
+    from typing import Tuple, Dict, Optional
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+
     print("[START ▶️] Generando SQL para agregar nuevas columnas desde mapeo...", flush=True)
-    source_table = config.get("source_table_to_add_fields")
-    source_field = config.get("source_table_to_add_fields_reference_field_name")
-    ref_df = config.get("referece_table_for_new_values_df")
+
+    # ───────── Validaciones
+    def _req_str(cfg, k):
+        v = cfg.get(k)
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            raise ValueError(f"[VALIDATION [ERROR ❌]] Falta parámetro obligatorio: '{k}'.")
+        return v
+
+    def _req_df(cfg, k):
+        v = cfg.get(k)
+        if not isinstance(v, pd.DataFrame) or v.empty:
+            raise ValueError(f"[VALIDATION [ERROR ❌]] '{k}' debe ser un DataFrame no vacío.")
+        return v
+
+    source_table  = _req_str(config, "source_table_to_add_fields")
+    source_field  = _req_str(config, "source_table_to_add_fields_reference_field_name")
+
+    ref_df        = _req_df(config, "referece_table_for_new_values_df")
+    ref_join_key  = _req_str(config, "referece_table_for_new_values_reference_field_name")
+
     ref_fields_dic = config.get("referece_table_for_new_values_field_names_dic")
-    non_matched = config.get("values_non_matched_result", "descartado")
-    if not (isinstance(source_table, str) and source_table):
-        raise ValueError("[VALIDATION [ERROR ❌]] 'source_table_to_add_fields' es obligatorio.")
-    if not (isinstance(source_field, str) and source_field):
-        raise ValueError("[VALIDATION [ERROR ❌]] 'source_table_to_add_fields_reference_field_name' es obligatorio.")
-    if not isinstance(ref_df, pd.DataFrame) or ref_df.empty:
-        raise ValueError("[VALIDATION [ERROR ❌]] 'referece_table_for_new_values_df' debe ser un DataFrame válido y no vacío.")
     if not isinstance(ref_fields_dic, dict) or not ref_fields_dic:
         raise ValueError("[VALIDATION [ERROR ❌]] 'referece_table_for_new_values_field_names_dic' debe ser un diccionario no vacío.")
-    
-    print("[METRICS [INFO ℹ️]] Parámetros validados.", flush=True)
 
-    def _normalize_text(text: str) -> str:
-        text = text.lower().strip()
-        text = unicodedata.normalize('NFD', text)
-        return ''.join(c for c in text if unicodedata.category(c) != 'Mn').strip()
+    non_matched      = config.get("values_non_matched_result", "descartado")
+    temp_table_name  = config.get("temp_table_name", "temp_new_columns_mapping")
+    temp_table_erase = bool(config.get("temp_table_erase", True))
+    sample_limit     = config.get("sample_limit")
+    location         = config.get("location")
+
+    # columnas del DF a añadir (solo True)
+    ref_field_names = [col for col, use_it in ref_fields_dic.items() if use_it is True]
+    if not ref_field_names:
+        raise ValueError("[VALIDATION [ERROR ❌]] No hay columnas marcadas como True en 'referece_table_for_new_values_field_names_dic'.")
+
+    # validar existencia de columnas en el DF de referencia (llave + columnas a añadir)
+    missing_in_ref = [c for c in [ref_join_key] + ref_field_names if c not in ref_df.columns]
+    if missing_in_ref:
+        raise ValueError(f"[VALIDATION [ERROR ❌]] Columnas faltantes en DF de referencia: {', '.join(missing_in_ref)}")
+
+    # formato tabla
+    def _split_table_name(full: str) -> Tuple[str, str, str]:
+        parts = full.split(".")
+        if len(parts) != 3:
+            raise ValueError("[VALIDATION [ERROR ❌]] El nombre de tabla debe ser 'proyecto.dataset.tabla'.")
+        return parts[0], parts[1], parts[2]
+
+    project_id, dataset_id, _ = _split_table_name(source_table)
+    aux_table = f"{project_id}.{dataset_id}.{temp_table_name}"
+
+    # ───────── Auth silenciosa
+    def _auth_with_scopes(scopes):
+        key_local = config.get("json_keyfile_local")
+        key_colab = config.get("json_keyfile_colab")
+        try:
+            if isinstance(key_local, str) and os.path.exists(key_local):
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile: {key_local}", flush=True)
+                return service_account.Credentials.from_service_account_file(key_local, scopes=scopes)
+            if isinstance(key_local, dict) and "client_email" in key_local:
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict local.", flush=True)
+                return service_account.Credentials.from_service_account_info(key_local, scopes=scopes)
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile local no utilizable: {e}", flush=True)
+        try:
+            if isinstance(key_colab, str) and os.path.exists(key_colab):
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile (colab): {key_colab}", flush=True)
+                return service_account.Credentials.from_service_account_file(key_colab, scopes=scopes)
+            if isinstance(key_colab, dict) and "client_email" in key_colab:
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict colab.", flush=True)
+                return service_account.Credentials.from_service_account_info(key_colab, scopes=scopes)
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile colab no utilizable: {e}", flush=True)
+        # fallback helper
+        try:
+            creds = _ini_authenticate_API(config, project_id, scopes)
+            print("[AUTHENTICATION [SUCCESS ✅]] Credenciales obtenidas por helper.", flush=True)
+            return creds
+        except Exception as e:
+            raise RuntimeError(f"[AUTHENTICATION [ERROR ❌]] {e}")
+
+    scopes = ["https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/drive"]
+    creds = _auth_with_scopes(scopes)
+    client = bigquery.Client(project=project_id, credentials=creds, location=location)
+
+    # ───────── utilidades de texto
+    def _normalize_text(x: str) -> str:
+        s = "" if x is None else str(x).lower().strip()
+        s = unicodedata.normalize('NFD', s)
+        s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+        s = re.sub(r'\s+', ' ', s)
+        return s.strip()
 
     def _sanitize_field_name(name: str) -> str:
-        name = name.lower().strip()
-        name = unicodedata.normalize('NFD', name)
-        name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
-        name = re.sub(r'\s+', '_', name)
-        name = re.sub(r'[^a-z0-9_]', '', name)
-        if re.match(r'^\d', name):
-            name = '_' + name
-        return name
+        s = unicodedata.normalize('NFD', str(name).lower().strip())
+        s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+        s = re.sub(r'\s+', '_', s)
+        s = re.sub(r'[^a-z0-9_]', '', s)
+        if re.match(r'^\d', s): s = '_' + s
+        s = re.sub(r'_+', '_', s).strip('_')
+        return s
 
-    ref_field_names = list(ref_fields_dic.keys())
-    sanitized_columns = {col: _sanitize_field_name(col) for col in ref_field_names}
+    sanitized_columns: Dict[str, str] = {col: _sanitize_field_name(col) for col in ref_field_names}
 
-    # Asumimos que _extract_source_values utiliza el cliente de BigQuery; este cliente se obtiene mediante _ini_authenticate_API
-    def _extract_source_values(tbl: str, field: str, client) -> pd.DataFrame:
-        query = f"SELECT DISTINCT `{field}` AS raw_value FROM `{tbl}`"
-        return client.query(query).to_dataframe()
+    # ───────── extraer llaves únicas de la fuente
+    def _extract_source_values(tbl: str, field: str, limit: Optional[int]) -> pd.DataFrame:
+        q = f"""
+            SELECT DISTINCT CAST({field} AS STRING) AS raw_value
+            FROM `{tbl}`
+            WHERE {field} IS NOT NULL AND TRIM(CAST({field} AS STRING)) != ''
+        """
+        if limit:
+            q += f"\nLIMIT {int(limit)}"
+        return client.query(q).to_dataframe()
 
-    def _build_reference_mapping(df_ref: pd.DataFrame, fields: list) -> dict:
-        mapping = {}
-        match_field = fields[0]
-        for _, row in df_ref.iterrows():
-            key_val = row.get(match_field)
-            if isinstance(key_val, str):
-                norm_key = _normalize_text(key_val)
-                mapping[norm_key] = {col: row.get(col, non_matched) for col in fields}
-        return mapping
-
-    def _apply_mapping(df_src: pd.DataFrame, ref_mapping: dict) -> dict:
-        mapping_results = {}
-        for raw in df_src["raw_value"]:
-            if not isinstance(raw, str) or not raw:
-                mapping_results[raw] = {col: non_matched for col in ref_field_names}
-                continue
-            norm_raw = _normalize_text(raw)
-            if norm_raw in ref_mapping:
-                mapping_results[raw] = ref_mapping[norm_raw]
-                print(f"[TRANSFORMATION SUCCESS ✅] [MATCH] '{raw}' encontrado en referencia.", flush=True)
-            else:
-                mapping_results[raw] = {col: non_matched for col in ref_field_names}
-                print(f"[TRANSFORMATION WARNING ⚠️] [NO MATCH] '{raw}' no encontrado.", flush=True)
-        return mapping_results
-
-    # Obtener cliente de BigQuery
-    from google.cloud import bigquery
-    client = bigquery.Client(project=source_table.split(".")[0], credentials=_ini_authenticate_API(config, source_table.split(".")[0]))
-    df_source = _extract_source_values(source_table, source_field, client)
+    print(f"[EXTRACTION [START ▶️]] Extrayendo valores únicos de `{source_field}` desde `{source_table}`...", flush=True)
+    df_source = _extract_source_values(source_table, source_field, sample_limit)
     if df_source.empty:
-        print("[EXTRACTION WARNING ⚠️] No se encontraron valores en la tabla source.", flush=True)
+        print("[EXTRACTION [WARNING ⚠️]] No se encontraron valores en la tabla source.", flush=True)
         return ("", pd.DataFrame())
-    print(f"[EXTRACTION SUCCESS ✅] Se encontraron {len(df_source)} valores únicos.", flush=True)
+    print(f"[EXTRACTION [SUCCESS ✅]] Se encontraron {len(df_source)} valores únicos.", flush=True)
 
-    ref_mapping = _build_reference_mapping(ref_df, ref_field_names)
+    # ───────── construir mapeo desde DF referencia usando SU LLAVE explícita
+    ref_df_local = ref_df.copy()
+    ref_df_local["_key_norm_"] = ref_df_local[ref_join_key].map(_normalize_text)
+
+    ref_mapping: Dict[str, Dict[str, object]] = {}
+    for _, row in ref_df_local.iterrows():
+        k = row["_key_norm_"]
+        if k == "":
+            continue
+        ref_mapping[k] = {col: row.get(col, non_matched) for col in ref_field_names}
+
+    # ───────── aplicar mapeo a los valores de la fuente
+    def _apply_mapping(df_src: pd.DataFrame, mapping: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+        out: Dict[str, Dict[str, object]] = {}
+        for raw in df_src["raw_value"]:
+            if not isinstance(raw, str) or raw.strip() == "":
+                out[raw] = {col: non_matched for col in ref_field_names}
+                print(f"[TRANSFORMATION [WARNING ⚠️]] Valor vacío o no string → no match.", flush=True)
+                continue
+            key = _normalize_text(raw)
+            if key in mapping:
+                out[raw] = mapping[key]
+                print(f"[TRANSFORMATION [SUCCESS ✅]] MATCH: '{raw}'", flush=True)
+            else:
+                out[raw] = {col: non_matched for col in ref_field_names}
+                print(f"[TRANSFORMATION [WARNING ⚠️]] NO MATCH: '{raw}'", flush=True)
+        return out
+
     mapping_results = _apply_mapping(df_source, ref_mapping)
-    mapping_rows = []
-    for raw, mapping_dict in mapping_results.items():
+
+    # ───────── conformar DataFrame auxiliar
+    rows = []
+    for raw, mdic in mapping_results.items():
         row = {"raw_value": raw}
-        for col, value in mapping_dict.items():
-            sanitized_col = sanitized_columns.get(col, col)
-            row[sanitized_col] = value
-        mapping_rows.append(row)
-    mapping_df = pd.DataFrame(mapping_rows)
-    
-    parts = source_table.split(".")
-    if len(parts) != 3:
-        raise ValueError("[VALIDATION ERROR ❌] 'source_table_to_add_fields' debe tener el formato 'proyecto.dataset.tabla'.")
-    dest_project, dest_dataset, _ = parts
-    aux_table = f"{dest_project}.{dest_dataset}.temp_new_columns_mapping"
-    
-    pandas_gbq.to_gbq(mapping_df, destination_table=aux_table, project_id=dest_project, if_exists="replace", credentials=client._credentials)
-    
-    join_fields = [col for col in ref_field_names if ref_fields_dic.get(col, False)]
-    new_columns_sql = ",\n".join([f"m.`{sanitized_columns[col]}` AS `{sanitized_columns[col]}`" for col in join_fields])
+        for col in ref_field_names:
+            row[sanitized_columns[col]] = mdic.get(col, non_matched)
+        rows.append(row)
+    mapping_df = pd.DataFrame(rows).drop_duplicates()
+
+    # ───────── subir auxiliar a GBQ
+    print(f"[LOAD [START ▶️]] Subiendo tabla auxiliar `{aux_table}`…", flush=True)
+    try:
+        import pandas_gbq
+        pandas_gbq.to_gbq(
+            mapping_df,
+            destination_table=aux_table,
+            project_id=project_id,
+            if_exists="replace",
+            credentials=creds
+        )
+        print("[LOAD [SUCCESS ✅]] Tabla auxiliar subida correctamente.", flush=True)
+    except Exception as e:
+        raise RuntimeError(f"[LOAD [ERROR ❌]] Error subiendo auxiliar a GBQ: {e}")
+
+    # ───────── SQL final (JOIN por el campo de la FUENTE)
+    select_new_cols = ",\n       ".join(
+        [f"m.`{sanitized_columns[col]}` AS `{sanitized_columns[col]}`" for col in ref_field_names]
+    ) or "/* sin columnas nuevas */"
+
     update_sql = (
         f"CREATE OR REPLACE TABLE `{source_table}` AS\n"
-        f"SELECT s.*, {new_columns_sql}\n"
+        f"SELECT s.*, \n       {select_new_cols}\n"
         f"FROM `{source_table}` s\n"
         f"LEFT JOIN `{aux_table}` m\n"
-        f"  ON s.`{source_field}` = m.raw_value;"
+        f"  ON CAST(s.`{source_field}` AS STRING) = m.raw_value;"
     )
-    drop_sql = f"DROP TABLE `{aux_table}`;"
-    sql_script = update_sql + "\n" + drop_sql
-    print("[END FINISHED ✅] SQL para nuevas columnas generado.", flush=True)
+    drop_sql = f"\nDROP TABLE `{aux_table}`;" if temp_table_erase else ""
+    sql_script = (update_sql + drop_sql).strip()
+
+    print("[END [FINISHED ✅]] SQL para nuevas columnas generado.", flush=True)
     return sql_script, mapping_df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
