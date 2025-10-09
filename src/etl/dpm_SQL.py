@@ -1,87 +1,254 @@
 from common.dpm_GCP_ini import _ini_authenticate_API
 
+
+
 # __________________________________________________________________________________________________________________________________________________________
 # GBQ_execute_SQL
 # __________________________________________________________________________________________________________________________________________________________
 def GBQ_execute_SQL(config: dict) -> None:
     """
-    Ejecuta un script SQL en Google BigQuery y muestra un resumen detallado de la ejecución.
+    Ejecuta un script SQL en Google BigQuery con:
+      - Autenticación silenciosa priorizando keyfile (local/colab) y scopes explícitos.
+      - Dry-run previo para estimar coste/bytes.
+      - JobConfig configurable (location, priority, maximum_bytes_billed, cache, legacy_sql, labels, write/create).
+      - Parámetros de consulta (Standard SQL).
+      - Métricas detalladas del job y de la tabla destino (si aplica).
 
-    Args:
-        config (dict):
-            - GCP_project_id (str): ID del proyecto de GCP.
-            - SQL_script (str): Script SQL a ejecutar.
-            - destination_table (str, opcional): Tabla destino para obtener estadísticas adicionales.
-            Además, config debe incluir las claves del diccionario común para autenticación.
+    Parámetros claves en config:
+      - GCP_project_id (str)             [OBLIGATORIO]
+      - SQL_script (str)                 [OBLIGATORIO]
+      - destination_table (str, opc.)    proyecto.dataset.tabla (para write/create disposition y métricas)
+      - location (str, opc.)             e.g. 'EU' | 'US'
+      - priority (str, opc.)             'INTERACTIVE' | 'BATCH' (default: 'INTERACTIVE')
+      - maximum_bytes_billed (int, opc.) límite duro de bytes facturables
+      - use_query_cache (bool, opc.)     default True
+      - use_legacy_sql (bool, opc.)      default False (Standard SQL)
+      - labels (dict, opc.)              etiquetas del job
+      - create_disposition (str, opc.)   'CREATE_IF_NEEDED' | 'CREATE_NEVER'
+      - write_disposition (str, opc.)    'WRITE_EMPTY' | 'WRITE_TRUNCATE' | 'WRITE_APPEND'
+      - query_parameters (list[dict], opc.) ver ejemplo abajo
+      - job_timeout_sec (int, opc.)      timeout para job.result()
 
-    Raises:
-        ValueError: Si faltan parámetros obligatorios o ocurre un error durante la autenticación o ejecución del script.
+      Auth (mismas claves que el resto del proyecto):
+      - json_keyfile_local (str|dict, opc.)
+      - json_keyfile_colab (str|dict, opc.)
+      - json_keyfile_GCP_secret_id (str, opc.)
+      - ini_environment_identificated (str, recomendado si no hay keyfile)
+
+    Ejemplo de query_parameters:
+      [
+        {"name": "min_date", "type": "DATE", "value": "2024-01-01"},
+        {"name": "top_n", "type": "INT64", "value": 100}
+      ]
 
     Returns:
-        None
+      None
+
+    Raises:
+      ValueError | RuntimeError: por validaciones, auth o ejecución.
     """
-    print("[START ▶️] Ejecución de script SQL en BigQuery", flush=True)
+    import os
     import time
+    from typing import Optional
     from google.cloud import bigquery
+    from google.oauth2 import service_account
 
-    def _validate_parameters(cfg: dict) -> tuple:
-        project_id = cfg.get('GCP_project_id')
-        sql_script = cfg.get('SQL_script')
-        if not project_id or not sql_script:
+    print("[START ▶️] Ejecución de script SQL en BigQuery", flush=True)
+
+    # ───────────────────────── Utilidades internas ─────────────────────────
+    def _validate_parameters(cfg: dict):
+        proj = cfg.get('GCP_project_id')
+        sql  = cfg.get('SQL_script')
+        if not proj or not sql:
             raise ValueError("[VALIDATION [ERROR ❌]] Falta 'GCP_project_id' o 'SQL_script' en config.")
-        destination_table = cfg.get('destination_table')
-        return project_id, sql_script, destination_table
+        return proj, sql, cfg.get('destination_table')
 
-    proj_id, sql_script, dest_table = _validate_parameters(config)
-    creds = _ini_authenticate_API(config, proj_id)
-    client = bigquery.Client(project=proj_id, credentials=creds)
+    def _auth_with_scopes(cfg: dict, scopes: list):
+        """
+        Prioriza keyfile (ruta o dict). Si no hay, cae a _ini_authenticate_API(cfg, project_id, scopes).
+        Evita ruido de metadata/Secret Manager cuando ya existe keyfile válido.
+        """
+        key_local = cfg.get("json_keyfile_local")
+        key_colab = cfg.get("json_keyfile_colab")
+        # 1) keyfile por ruta/dict (local)
+        try:
+            if isinstance(key_local, str) and os.path.exists(key_local):
+                creds = service_account.Credentials.from_service_account_file(key_local, scopes=scopes)
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile: {key_local}", flush=True)
+                return creds
+            if isinstance(key_local, dict) and "client_email" in key_local:
+                creds = service_account.Credentials.from_service_account_info(key_local, scopes=scopes)
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict local.", flush=True)
+                return creds
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile local no utilizable: {e}", flush=True)
+        # 2) keyfile por ruta/dict (colab)
+        try:
+            if isinstance(key_colab, str) and os.path.exists(key_colab):
+                creds = service_account.Credentials.from_service_account_file(key_colab, scopes=scopes)
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile (colab): {key_colab}", flush=True)
+                return creds
+            if isinstance(key_colab, dict) and "client_email" in key_colab:
+                creds = service_account.Credentials.from_service_account_info(key_colab, scopes=scopes)
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict colab.", flush=True)
+                return creds
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile colab no utilizable: {e}", flush=True)
+        # 3) Fallback: helper del proyecto (puede usar secretos/ADC)
+        try:
+            creds = _ini_authenticate_API(cfg, cfg.get('GCP_project_id'), scopes)
+            print("[AUTHENTICATION [SUCCESS ✅]] Credenciales obtenidas por helper.", flush=True)
+            return creds
+        except Exception as e:
+            raise RuntimeError(f"[AUTHENTICATION [ERROR ❌]] {e}")
 
-    def _show_script_summary(sql_script: str) -> None:
-        action = sql_script.strip().split()[0]
-        print(f"[EXTRACTION INFO ℹ️] Acción detectada en el script SQL: {action}", flush=True)
-        print("[EXTRACTION INFO ℹ️] Resumen (primeras 5 líneas):", flush=True)
-        for line in sql_script.strip().split('\n')[:5]:
-            print(line, flush=True)
-        print("...", flush=True)
+    def _show_script_summary(sql: str) -> None:
+        print("[EXTRACTION [INFO ℹ️]] Resumen del script:", flush=True)
+        head = (sql.strip().split('\n')[:5]) or []
+        action = sql.strip().split()[0] if sql.strip() else "N/A"
+        print(f"  • Acción detectada: {action}", flush=True)
+        for i, line in enumerate(head, 1):
+            print(f"  • L{i}: {line}", flush=True)
+        if len(sql.strip().split('\n')) > 5:
+            print("  • ...", flush=True)
 
-    def _execute_query(client: bigquery.Client, sql_script: str, start_time: float):
-        print("[TRANSFORMATION START ▶️] Ejecutando el script SQL...", flush=True)
-        query_job = client.query(sql_script)
-        query_job.result()
-        elapsed = time.time() - start_time
-        print("[TRANSFORMATION SUCCESS ✅] Consulta ejecutada exitosamente.", flush=True)
-        return query_job, elapsed
+    def _build_job_config(cfg: dict, dest_table: Optional[str]) -> bigquery.QueryJobConfig:
+        jc = bigquery.QueryJobConfig()
+        # Dialecto y cache
+        jc.use_legacy_sql  = bool(cfg.get('use_legacy_sql', False))
+        jc.use_query_cache = bool(cfg.get('use_query_cache', True))
+        # Priority y labels
+        pr = str(cfg.get('priority', 'INTERACTIVE')).upper()
+        if pr in ('INTERACTIVE', 'BATCH'):
+            jc.priority = getattr(bigquery.QueryPriority, pr)
+        if isinstance(cfg.get('labels'), dict):
+            jc.labels = cfg['labels']
+        # Límite de coste
+        if cfg.get('maximum_bytes_billed') is not None:
+            jc.maximum_bytes_billed = int(cfg['maximum_bytes_billed'])
+        # Tabla destino y disposiciones
+        if dest_table:
+            jc.destination = bigquery.TableReference.from_string(dest_table)
+            if cfg.get('write_disposition'):
+                jc.write_disposition = getattr(bigquery.WriteDisposition, cfg['write_disposition'])
+            if cfg.get('create_disposition'):
+                jc.create_disposition = getattr(bigquery.CreateDisposition, cfg['create_disposition'])
+        # Parámetros de consulta (Standard SQL)
+        params_cfg = cfg.get('query_parameters') or []
+        if params_cfg and not jc.use_legacy_sql:
+            qp = []
+            for p in params_cfg:
+                name = p.get("name")
+                typ  = (p.get("type") or "").upper()
+                val  = p.get("value")
+                if not name or not typ:
+                    continue
+                if typ in ("INT64","INTEGER"):
+                    qp.append(bigquery.ScalarQueryParameter(name, "INT64", int(val) if val is not None else None))
+                elif typ in ("FLOAT64","FLOAT"):
+                    qp.append(bigquery.ScalarQueryParameter(name, "FLOAT64", float(val) if val is not None else None))
+                elif typ in ("BOOL","BOOLEAN"):
+                    qp.append(bigquery.ScalarQueryParameter(name, "BOOL", bool(val)))
+                elif typ in ("STRING","BYTES"):
+                    qp.append(bigquery.ScalarQueryParameter(name, "STRING", None if val is None else str(val)))
+                elif typ in ("DATE","DATETIME","TIME","TIMESTAMP"):
+                    # Pasamos como string; el parser de BigQuery lo interpreta según el tipo
+                    qp.append(bigquery.ScalarQueryParameter(name, typ, None if val is None else str(val)))
+                else:
+                    # Fallback a STRING
+                    qp.append(bigquery.ScalarQueryParameter(name, "STRING", None if val is None else str(val)))
+            jc.query_parameters = qp
+        return jc
 
-    def _show_job_details(client: bigquery.Client, query_job, elapsed: float, dest_table: str) -> None:
-        print("[METRICS INFO ℹ️] Detalles del job de BigQuery:", flush=True)
-        print(f"  - ID del job: {query_job.job_id}", flush=True)
-        print(f"  - Estado: {query_job.state}", flush=True)
-        print(f"  - Tiempo de creación: {query_job.created}", flush=True)
-        if hasattr(query_job, 'started'):
-            print(f"  - Tiempo de inicio: {query_job.started}", flush=True)
-        if hasattr(query_job, 'ended'):
-            print(f"  - Tiempo de finalización: {query_job.ended}", flush=True)
-        print(f"  - Bytes procesados: {query_job.total_bytes_processed or 'N/A'}", flush=True)
-        print(f"  - Bytes facturados: {query_job.total_bytes_billed or 'N/A'}", flush=True)
-        print(f"  - Cache hit: {query_job.cache_hit}", flush=True)
+    def _dry_run(client: bigquery.Client, sql: str, jc: bigquery.QueryJobConfig, location: Optional[str]):
+        cfg = bigquery.QueryJobConfig.from_api_repr(jc.to_api_repr())  # copiar
+        cfg.dry_run = True
+        cfg.use_query_cache = False
+        print("[TRANSFORMATION [START ▶️]] Dry-run para estimar coste/bytes…", flush=True)
+        job = client.query(sql, job_config=cfg, location=location)
+        # No .result() en dry-run
+        stats = job._properties.get("statistics", {})
+        tbp = stats.get("totalBytesProcessed")
+        cache = job._properties.get("statistics", {}).get("query", {}).get("cacheHit")
+        print(f"[TRANSFORMATION [SUCCESS ✅]] Dry-run OK. Bytes procesados estimados: {tbp or 'N/A'} | cache_hit: {cache}", flush=True)
+        return tbp, cache
+
+    def _execute_query(client: bigquery.Client, sql: str, jc: bigquery.QueryJobConfig, location: Optional[str], timeout_sec: Optional[int]):
+        print("[TRANSFORMATION [START ▶️]] Ejecutando script SQL…", flush=True)
+        t0 = time.time()
+        job = client.query(sql, job_config=jc, location=location)
+        job.result(timeout=timeout_sec)  # espera terminación
+        elapsed = time.time() - t0
+        print("[TRANSFORMATION [SUCCESS ✅]] Consulta ejecutada exitosamente.", flush=True)
+        return job, elapsed
+
+    def _show_job_details(client: bigquery.Client, job: bigquery.job.QueryJob, elapsed: float, dest_table: Optional[str]) -> None:
+        print("[METRICS [INFO 📊]] Detalles del job de BigQuery:", flush=True)
+        print(f"  • Job ID: {job.job_id}", flush=True)
+        print(f"  • Estado: {job.state}", flush=True)
+        print(f"  • Creado: {getattr(job, 'created', 'N/A')}", flush=True)
+        print(f"  • Iniciado: {getattr(job, 'started', 'N/A')}", flush=True)
+        print(f"  • Finalizado: {getattr(job, 'ended', 'N/A')}", flush=True)
+        print(f"  • Tiempo total: {elapsed:0.2f}s", flush=True)
+
+        qstats = getattr(job, "query_plan", None)
+        props  = getattr(job, "_properties", {})
+        qmeta  = props.get("statistics", {}).get("query", {})
+        print(f"  • Bytes procesados: {getattr(job, 'total_bytes_processed', None) or qmeta.get('totalBytesProcessed') or 'N/A'}", flush=True)
+        print(f"  • Bytes facturados: {getattr(job, 'total_bytes_billed', None) or qmeta.get('totalBytesBilled') or 'N/A'}", flush=True)
+        print(f"  • Cache hit: {qmeta.get('cacheHit', 'N/A')}", flush=True)
+        if qmeta.get("statementType"):
+            print(f"  • Tipo de sentencia: {qmeta.get('statementType')}", flush=True)
+        if qmeta.get("referencedTables"):
+            refs = [f"{t.get('projectId')}.{t.get('datasetId')}.{t.get('tableId')}" for t in qmeta["referencedTables"]]
+            print(f"  • Tablas referenciadas ({len(refs)}): {', '.join(refs[:10])}{'…' if len(refs)>10 else ''}", flush=True)
+
         if dest_table:
             try:
-                count_query = f"SELECT COUNT(*) AS total_rows FROM `{dest_table}`"
-                count_result = client.query(count_query).result()
-                rows_in_table = [row['total_rows'] for row in count_result][0]
-                print(f"  - Filas en la tabla destino: {rows_in_table}", flush=True)
+                tbl = client.get_table(dest_table)
+                print("  • Tabla destino:", flush=True)
+                print(f"     - {tbl.project}.{tbl.dataset_id}.{tbl.table_id}", flush=True)
+                print(f"     - Filas: {tbl.num_rows} | Bytes: {tbl.num_bytes}", flush=True)
+                print(f"     - Particiones: {getattr(tbl, 'time_partitioning', None)}", flush=True)
+                print(f"     - Clustering: {getattr(tbl, 'clustering_fields', None)}", flush=True)
             except Exception as e:
-                print(f"[METRICS WARNING ⚠️] No se pudo obtener información de la tabla destino: {e}", flush=True)
-        print(f"[END FINISHED ✅] Tiempo total de ejecución: {elapsed:.2f} segundos", flush=True)
+                print(f"[METRICS [WARNING ⚠️]] No se pudo leer metadata de la tabla destino: {e}", flush=True)
 
-    _show_script_summary(sql_script)
-    start = time.time()
+        print("[END [FINISHED ✅]] Ejecución finalizada.", flush=True)
+
+    # ───────────────────────── Ejecución ─────────────────────────
     try:
-        query_job, elapsed = _execute_query(client, sql_script, start)
-        _show_job_details(client, query_job, elapsed, dest_table)
+        proj_id, sql_script, dest_table = _validate_parameters(config)
+
+        scopes = ["https://www.googleapis.com/auth/bigquery",
+                  "https://www.googleapis.com/auth/drive"]
+        creds = _auth_with_scopes(config, scopes)
+        client = bigquery.Client(project=proj_id, credentials=creds, location=config.get('location'))
+
+        _show_script_summary(sql_script)
+
+        # JobConfig (común) y valores de control
+        job_cfg   = _build_job_config(config, dest_table)
+        location  = config.get('location')
+        timeout_s = config.get('job_timeout_sec')  # None → sin timeout
+
+        # Dry-run (si no se desactiva explícitamente)
+        if config.get('dry_run_disable', False) is not True:
+            try:
+                _dry_run(client, sql_script, job_cfg, location)
+            except Exception as e:
+                print(f"[TRANSFORMATION [WARNING ⚠️]] Dry-run falló (se continúa con ejecución real): {e}", flush=True)
+
+        # Ejecutar
+        job, elapsed = _execute_query(client, sql_script, job_cfg, location, timeout_s)
+
+        # Métricas finales
+        _show_job_details(client, job, elapsed, dest_table)
+
     except Exception as e:
-        print(f"[TRANSFORMATION ERROR ❌] Error al ejecutar el script SQL: {str(e)}", flush=True)
+        print(f"[TRANSFORMATION [ERROR ❌]] Error al ejecutar el script SQL: {e}", flush=True)
         raise
+
 
 
 
