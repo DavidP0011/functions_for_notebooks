@@ -1387,143 +1387,258 @@ def SQL_generate_new_columns_from_mapping(config: dict) -> tuple:
 
 
 # __________________________________________________________________________________________________________________________________________________________
+from common.dpm_GCP_ini import _ini_authenticate_API
+
 def SQL_generation_normalize_strings(config: dict) -> tuple:
     """
-    Normaliza los valores de una columna en una tabla de BigQuery utilizando mapeo manual y fuzzy matching.
-    Sube una tabla auxiliar con el mapeo y genera un script SQL para actualizar la tabla fuente.
+    Normaliza los valores de una columna en BigQuery usando mapeo manual y (opcional) fuzzy matching.
+    Sube una tabla auxiliar con el mapeo y genera un SQL para actualizar la tabla fuente.
 
     Parámetros en config:
-      - source_table_to_normalize (str): Tabla fuente.
-      - source_table_to_normalize_field_name (str): Columna a normalizar.
-      - referece_table_for_normalization_manual_df (pd.DataFrame): DataFrame con columnas 'Bruto' y 'Normalizado'.
-      - referece_table_for_normalization_rapidfuzz_df (pd.DataFrame): DataFrame para fuzzy matching.
-      - referece_table_for_normalization_rapidfuzz_field_name (str): Columna candidata para fuzzy matching.
-      - rapidfuzz_score_filter_use (bool)
-      - rapidfuzz_score_filter_min_value (int/float)
-      - rapidfuzz_score_filter_no_pass_mapping (str)
-      - destination_field_name (str, opcional): Nombre del campo donde se almacenará el valor normalizado.
-      Además, config debe incluir las claves comunes para autenticación.
+      - source_table_to_normalize (str)                           proyecto.dataset.tabla
+      - source_table_to_normalize_field_name (str)                columna a normalizar (en la tabla fuente)
+      - referece_table_for_normalization_manual_df (pd.DataFrame) DataFrame con columnas ['Bruto','Normalizado']
+      - referece_table_for_normalization_rapidfuzz_df (pd.DataFrame) DF con candidatos para fuzzy
+      - referece_table_for_normalization_rapidfuzz_field_name (str) Columna en el DF anterior que contiene candidatos
+      - rapidfuzz_score_filter_use (bool, opc.)                   default False
+      - rapidfuzz_score_filter_min_value (int|float, opc.)        default 0
+      - rapidfuzz_score_filter_no_pass_mapping (str, opc.)        default 'descartado'
+      - destination_field_name (str, opc.)                        si vacío: reemplaza la columna original
+      - temp_table_name (str, opc.)                               default 'temp_normalized_strings'
+      - temp_table_erase (bool, opc.)                             default True
+      - sample_limit (int, opc.)                                  limita valores distintos para pruebas
+      - location (str, opc.)                                      región BQ (e.g. 'EU'|'US')
+
+      Autenticación:
+      - json_keyfile_local | json_keyfile_colab | json_keyfile_GCP_secret_id | ini_environment_identificated
 
     Retorna:
-        tuple: (sql_script (str), df_fuzzy_results (pd.DataFrame))
+      tuple: (sql_script: str, df_fuzzy_results: pd.DataFrame)
+
+    Raises:
+      ValueError | RuntimeError
     """
-    # Importar librerías necesarias
-    import pandas as pd
-    import pandas_gbq
-    import unicodedata
+    import os
     import re
-    print("[NORMALIZATION START ▶️] Iniciando normalización de cadenas...", flush=True)
-    source_table = config.get("source_table_to_normalize")
-    source_field = config.get("source_table_to_normalize_field_name")
-    manual_df = config.get("referece_table_for_normalization_manual_df")
-    rapidfuzz_df = config.get("referece_table_for_normalization_rapidfuzz_df")
-    rapidfuzz_field = config.get("referece_table_for_normalization_rapidfuzz_field_name")
-    rapidfuzz_filter_use = config.get("rapidfuzz_score_filter_use", False)
-    rapidfuzz_min_score = config.get("rapidfuzz_score_filter_min_value", 0)
-    rapidfuzz_no_pass_value = config.get("rapidfuzz_score_filter_no_pass_mapping", "descartado")
-    destination_field_name = config.get("destination_field_name", "").strip()
-    
-    if not (isinstance(source_table, str) and source_table):
-        raise ValueError("[VALIDATION [ERROR ❌]] 'source_table_to_normalize' es obligatorio.")
-    if not (isinstance(source_field, str) and source_field):
-        raise ValueError("[VALIDATION [ERROR ❌]] 'source_table_to_normalize_field_name' es obligatorio.")
-    if not isinstance(manual_df, pd.DataFrame) or manual_df.empty:
-        raise ValueError("[VALIDATION [ERROR ❌]] 'referece_table_for_normalization_manual_df' debe ser un DataFrame no vacío.")
-    if not isinstance(rapidfuzz_df, pd.DataFrame) or rapidfuzz_df.empty:
-        raise ValueError("[VALIDATION [ERROR ❌]] 'referece_table_for_normalization_rapidfuzz_df' debe ser un DataFrame no vacío.")
-    if not (isinstance(rapidfuzz_field, str) and rapidfuzz_field):
-        raise ValueError("[VALIDATION [ERROR ❌]] 'referece_table_for_normalization_rapidfuzz_field_name' es obligatorio.")
+    import unicodedata
+    import pandas as pd
+    from typing import Tuple, Optional, Dict
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
 
+    print("[NORMALIZATION [START ▶️]] Iniciando normalización de cadenas...", flush=True)
+
+    # ───────────────────────────── Validaciones (type-aware) ─────────────────────────────
+    def _req_str(cfg: dict, key: str) -> str:
+        val = cfg.get(key)
+        if val is None or (isinstance(val, str) and val.strip() == ""):
+            raise ValueError(f"[VALIDATION [ERROR ❌]] Falta parámetro obligatorio: '{key}'.")
+        return val
+
+    def _req_df(cfg: dict, key: str) -> "pd.DataFrame":
+        val = cfg.get(key)
+        if not isinstance(val, pd.DataFrame) or val.empty:
+            raise ValueError(f"[VALIDATION [ERROR ❌]] '{key}' debe ser un DataFrame no vacío.")
+        return val
+
+    source_table = _req_str(config, "source_table_to_normalize")
+    source_field = _req_str(config, "source_table_to_normalize_field_name")
+    manual_df    = _req_df(config, "referece_table_for_normalization_manual_df")
+    rapidfuzz_df = _req_df(config, "referece_table_for_normalization_rapidfuzz_df")
+    rapidfuzz_field = _req_str(config, "referece_table_for_normalization_rapidfuzz_field_name")
+
+    rapidfuzz_filter_use   = bool(config.get("rapidfuzz_score_filter_use", False))
+    rapidfuzz_min_score    = float(config.get("rapidfuzz_score_filter_min_value", 0))
+    rapidfuzz_no_pass_val  = config.get("rapidfuzz_score_filter_no_pass_mapping", "descartado")
+    destination_field_name = (config.get("destination_field_name") or "").strip()
+    temp_table_name        = config.get("temp_table_name", "temp_normalized_strings")
+    temp_table_erase       = bool(config.get("temp_table_erase", True))
+    sample_limit           = config.get("sample_limit")  # None o int
+    location               = config.get("location")
+
+
+    # Validar formato tabla
+    def _split_table_name(full: str) -> Tuple[str, str, str]:
+        parts = full.split(".")
+        if len(parts) != 3:
+            raise ValueError("[VALIDATION [ERROR ❌]] El nombre de tabla debe ser 'proyecto.dataset.tabla'.")
+        return parts[0], parts[1], parts[2]
+
+    src_project, src_dataset, _ = _split_table_name(source_table)
+    dest_project, dest_dataset, _ = _split_table_name(source_table)  # mismo dataset por defecto
+    aux_table = f"{dest_project}.{dest_dataset}.{temp_table_name}"
+
+    # ───────────────────────────── Autenticación ─────────────────────────────
+    def _auth_with_scopes(scopes: list):
+        """
+        Prioriza keyfile (ruta|dict). Si no, cae al helper _ini_authenticate_API(config, project_id, scopes).
+        Evita ruido de metadata/Secret Manager cuando ya existe keyfile válido.
+        """
+        key_local = config.get("json_keyfile_local")
+        key_colab = config.get("json_keyfile_colab")
+        # Keyfile local
+        try:
+            if isinstance(key_local, str) and os.path.exists(key_local):
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile: {key_local}", flush=True)
+                return service_account.Credentials.from_service_account_file(key_local, scopes=scopes)
+            if isinstance(key_local, dict) and "client_email" in key_local:
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict local.", flush=True)
+                return service_account.Credentials.from_service_account_info(key_local, scopes=scopes)
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile local no utilizable: {e}", flush=True)
+        # Keyfile colab
+        try:
+            if isinstance(key_colab, str) and os.path.exists(key_colab):
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile (colab): {key_colab}", flush=True)
+                return service_account.Credentials.from_service_account_file(key_colab, scopes=scopes)
+            if isinstance(key_colab, dict) and "client_email" in key_colab:
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict colab.", flush=True)
+                return service_account.Credentials.from_service_account_info(key_colab, scopes=scopes)
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile colab no utilizable: {e}", flush=True)
+        # Fallback helper
+        try:
+            creds = _ini_authenticate_API(config, src_project, scopes)
+            print("[AUTHENTICATION [SUCCESS ✅]] Credenciales obtenidas por helper.", flush=True)
+            return creds
+        except Exception as e:
+            raise RuntimeError(f"[AUTHENTICATION [ERROR ❌]] {e}")
+
+    scopes = ["https://www.googleapis.com/auth/bigquery",
+              "https://www.googleapis.com/auth/drive"]
+    creds = _auth_with_scopes(scopes)
+    client = bigquery.Client(project=src_project, credentials=creds, location=location)
+
+    # ───────────────────────────── Utilidades de normalización ──────────────────────
     def _normalize_text(text: str) -> str:
-        text = text.lower().strip()
-        text = unicodedata.normalize('NFD', text)
-        return ''.join(c for c in text if unicodedata.category(c) != 'Mn').strip()
+        if text is None:
+            return ""
+        t = str(text).lower().strip()
+        t = unicodedata.normalize('NFD', t)
+        t = ''.join(c for c in t if unicodedata.category(c) != 'Mn')   # sin acentos
+        t = re.sub(r'\s+', ' ', t)                                     # espacios simples
+        return t.strip()
 
-    def _extract_source_values(tbl: str, field: str, client) -> pd.DataFrame:
-        query = f"SELECT DISTINCT `{field}` AS raw_value FROM `{tbl}`"
-        return client.query(query).to_dataframe()
+    def _extract_source_values(tbl: str, field: str, limit: Optional[int]) -> pd.DataFrame:
+        q = f"""
+            SELECT DISTINCT CAST({field} AS STRING) AS raw_value
+            FROM `{tbl}`
+            WHERE {field} IS NOT NULL AND TRIM(CAST({field} AS STRING)) != ''
+        """
+        if limit:
+            q += f"\nLIMIT {int(limit)}"
+        return client.query(q).to_dataframe()
 
-    def _build_manual_mapping(df_manual: pd.DataFrame) -> dict:
+    def _build_manual_mapping(df_manual: pd.DataFrame) -> Dict[str, str]:
+        if not set(["Bruto","Normalizado"]).issubset(df_manual.columns):
+            cols = ', '.join(df_manual.columns)
+            raise ValueError(f"[VALIDATION [ERROR ❌]] El DF manual debe tener columnas ['Bruto','Normalizado']. Recibido: {cols}")
         mapping = {}
         for _, row in df_manual.iterrows():
             bruto = row["Bruto"]
-            normalizado = row["Normalizado"]
-            if isinstance(bruto, str):
-                mapping[_normalize_text(bruto)] = normalizado
+            normalized = row["Normalizado"]
+            if isinstance(bruto, str) and isinstance(normalized, str):
+                mapping[_normalize_text(bruto)] = normalized
         return mapping
 
-    def _build_rapidfuzz_candidates(df_rapid: pd.DataFrame, field: str) -> dict:
+    def _build_rapidfuzz_candidates(df_rapid: pd.DataFrame, field: str) -> Dict[str, str]:
+        if field not in df_rapid.columns:
+            raise ValueError(f"[VALIDATION [ERROR ❌]] La columna '{field}' no existe en el DF de fuzzy.")
         candidates = {}
         for _, row in df_rapid.iterrows():
-            candidate = row[field]
-            if isinstance(candidate, str):
-                candidates[_normalize_text(candidate)] = candidate
+            cand = row[field]
+            if isinstance(cand, str) and cand.strip() != "":
+                candidates[_normalize_text(cand)] = cand
         return candidates
 
-    def _apply_mapping(df_src: pd.DataFrame, manual_map: dict, rapid_candidates: dict) -> tuple:
-        from rapidfuzz import process, fuzz
-        mapping_results = {}
-        fuzzy_results_list = []
-        candidate_keys = list(rapid_candidates.keys())
-        for raw in df_src["raw_value"]:
-            if not isinstance(raw, str) or not raw:
-                mapping_results[raw] = raw
-                continue
-            normalized_raw = _normalize_text(raw)
-            if normalized_raw in manual_map:
-                mapping_results[raw] = manual_map[normalized_raw]
-                print(f"[TRANSFORMATION SUCCESS ✅] [MANUAL] '{raw}' mapeado a: {manual_map[normalized_raw]}", flush=True)
-            else:
-                best_match = process.extractOne(normalized_raw, candidate_keys, scorer=fuzz.ratio)
-                if best_match:
-                    match_key, score, _ = best_match
-                    if rapidfuzz_filter_use and score < rapidfuzz_min_score:
-                        mapping_results[raw] = rapidfuzz_no_pass_value
-                        fuzzy_results_list.append({source_field: raw, "normalized_value": rapidfuzz_no_pass_value, "Rapidfuzz score": score})
-                        print(f"[TRANSFORMATION WARNING ⚠️] [FUZZY] '{raw}' obtuvo score {score} (< {rapidfuzz_min_score}). Se asigna: {rapidfuzz_no_pass_value}", flush=True)
-                    else:
-                        mapping_results[raw] = rapid_candidates[match_key]
-                        fuzzy_results_list.append({source_field: raw, "normalized_value": rapid_candidates[match_key], "Rapidfuzz score": score})
-                        print(f"[TRANSFORMATION SUCCESS ✅] [FUZZY] '{raw}' mapeado a: {rapid_candidates[match_key]} (Score: {score})", flush=True)
-                else:
-                    mapping_results[raw] = rapidfuzz_no_pass_value
-                    fuzzy_results_list.append({source_field: raw, "normalized_value": rapidfuzz_no_pass_value, "Rapidfuzz score": None})
-                    print(f"[TRANSFORMATION ERROR ❌] No se encontró mapeo para '{raw}'. Se asigna: {rapidfuzz_no_pass_value}", flush=True)
-        return mapping_results, fuzzy_results_list
-
-    print(f"[EXTRACTION START ▶️] Extrayendo valores únicos de `{source_field}` desde {source_table}...", flush=True)
-    from google.cloud import bigquery
-    client = bigquery.Client(project=source_table.split(".")[0], credentials=_ini_authenticate_API(config, source_table.split(".")[0]))
-    df_source = _extract_source_values(source_table, source_field, client)
+    # ───────────────────────────── Extracción fuente ────────────────────────────────
+    print(f"[EXTRACTION [START ▶️]] Extrayendo valores únicos de `{source_field}` desde `{source_table}`...", flush=True)
+    df_source = _extract_source_values(source_table, source_field, sample_limit)
     if df_source.empty:
-        print("[EXTRACTION WARNING ⚠️] No se encontraron valores en la columna fuente.", flush=True)
+        print("[EXTRACTION [WARNING ⚠️]] No se encontraron valores en la columna fuente.", flush=True)
         return ("", pd.DataFrame())
-    print(f"[EXTRACTION SUCCESS ✅] Se encontraron {len(df_source)} valores únicos.", flush=True)
+    print(f"[EXTRACTION [SUCCESS ✅]] Valores únicos recuperados: {len(df_source)}", flush=True)
 
-    manual_map = _build_manual_mapping(manual_df)
+    # ───────────────────────────── Construcción de mapeos ───────────────────────────
+    manual_map      = _build_manual_mapping(manual_df)
     rapid_candidates = _build_rapidfuzz_candidates(rapidfuzz_df, rapidfuzz_field)
-    mapping_results, fuzzy_results_list = _apply_mapping(df_source, manual_map, rapid_candidates)
-    
-    mapping_df = pd.DataFrame(list(mapping_results.items()), columns=["raw_value", "normalized_value"])
-    parts = source_table.split(".")
-    if len(parts) != 3:
-        raise ValueError("[VALIDATION ERROR ❌] 'source_table_to_normalize' debe tener el formato 'proyecto.dataset.tabla'.")
-    dest_project, dest_dataset, _ = parts
-    aux_table = f"{dest_project}.{dest_dataset}.temp_normalized_strings"
-    
-    pandas_gbq.to_gbq(mapping_df,
-                      destination_table=aux_table,
-                      project_id=dest_project,
-                      if_exists="replace",
-                      credentials=client._credentials)
-    
+
+    # Fuzzy opcional (si hay librería)
+    try:
+        from rapidfuzz import process, fuzz  # type: ignore
+        rapidfuzz_available = True
+    except Exception:
+        rapidfuzz_available = False
+        if rapidfuzz_filter_use:
+            print("[TRANSFORMATION [WARNING ⚠️]] 'rapidfuzz' no disponible: el filtrado por score no se aplicará.", flush=True)
+
+    print("[TRANSFORMATION [START ▶️]] Aplicando mapeo manual y fuzzy…", flush=True)
+    mapping_results = {}
+    fuzzy_results_list = []
+    candidate_keys = list(rapid_candidates.keys())
+
+    for raw in df_source["raw_value"]:
+        if not isinstance(raw, str) or raw.strip() == "":
+            mapping_results[raw] = raw
+            fuzzy_results_list.append({source_field: raw, "normalized_value": raw, "Rapidfuzz score": None, "method": "none"})
+            continue
+
+        norm_raw = _normalize_text(raw)
+
+        # 1) Mapeo manual
+        if norm_raw in manual_map:
+            normalized_value = manual_map[norm_raw]
+            mapping_results[raw] = normalized_value
+            fuzzy_results_list.append({source_field: raw, "normalized_value": normalized_value, "Rapidfuzz score": 100, "method": "manual"})
+            print(f"[TRANSFORMATION [SUCCESS ✅]] [MANUAL] '{raw}' → '{normalized_value}'", flush=True)
+            continue
+
+        # 2) Fuzzy (si librería disponible y hay candidatos)
+        if rapidfuzz_available and candidate_keys:
+            best = process.extractOne(norm_raw, candidate_keys, scorer=fuzz.ratio)
+            if best:
+                match_key, score, _ = best
+                if rapidfuzz_filter_use and score < rapidfuzz_min_score:
+                    mapping_results[raw] = rapidfuzz_no_pass_val
+                    fuzzy_results_list.append({source_field: raw, "normalized_value": rapidfuzz_no_pass_val, "Rapidfuzz score": score, "method": "fuzzy_filtered"})
+                    print(f"[TRANSFORMATION [WARNING ⚠️]] [FUZZY] '{raw}' score={score} < {rapidfuzz_min_score} → '{rapidfuzz_no_pass_val}'", flush=True)
+                else:
+                    normalized_value = rapid_candidates[match_key]
+                    mapping_results[raw] = normalized_value
+                    fuzzy_results_list.append({source_field: raw, "normalized_value": normalized_value, "Rapidfuzz score": score, "method": "fuzzy"})
+                    print(f"[TRANSFORMATION [SUCCESS ✅]] [FUZZY] '{raw}' → '{normalized_value}' (score={score})", flush=True)
+                continue
+
+        # 3) Sin mapeo
+        mapping_results[raw] = rapidfuzz_no_pass_val
+        fuzzy_results_list.append({source_field: raw, "normalized_value": rapidfuzz_no_pass_val, "Rapidfuzz score": None, "method": "default"})
+        print(f"[TRANSFORMATION [WARNING ⚠️]] Sin mapeo para '{raw}' → '{rapidfuzz_no_pass_val}'", flush=True)
+
+    mapping_df = pd.DataFrame(list(mapping_results.items()), columns=["raw_value", "normalized_value"]).drop_duplicates()
+
+    # ───────────────────────────── Carga a GBQ (tabla auxiliar) ─────────────────────
+    print(f"[LOAD [START ▶️]] Subiendo tabla auxiliar `{aux_table}`…", flush=True)
+    try:
+        import pandas_gbq
+        pandas_gbq.to_gbq(
+            mapping_df,
+            destination_table=aux_table,
+            project_id=dest_project,
+            if_exists="replace",
+            credentials=creds
+        )
+        print("[LOAD [SUCCESS ✅]] Tabla auxiliar subida correctamente.", flush=True)
+    except Exception as e:
+        raise RuntimeError(f"[LOAD [ERROR ❌]] Error subiendo auxiliar a GBQ: {e}")
+
+    # ───────────────────────────── SQL final (CREATE OR REPLACE) ────────────────────
     if destination_field_name:
         update_sql = (
             f"CREATE OR REPLACE TABLE `{source_table}` AS\n"
             f"SELECT s.*, m.normalized_value AS `{destination_field_name}`\n"
             f"FROM `{source_table}` s\n"
             f"LEFT JOIN `{aux_table}` m\n"
-            f"  ON s.`{source_field}` = m.raw_value;"
+            f"  ON CAST(s.`{source_field}` AS STRING) = m.raw_value;"
         )
     else:
         update_sql = (
@@ -1531,12 +1646,22 @@ def SQL_generation_normalize_strings(config: dict) -> tuple:
             f"SELECT s.* REPLACE(m.normalized_value AS `{source_field}`)\n"
             f"FROM `{source_table}` s\n"
             f"LEFT JOIN `{aux_table}` m\n"
-            f"  ON s.`{source_field}` = m.raw_value;"
+            f"  ON CAST(s.`{source_field}` AS STRING) = m.raw_value;"
         )
-    drop_sql = f"DROP TABLE `{aux_table}`;"
-    sql_script = update_sql + "\n" + drop_sql
-    print("[END FINISHED ✅] SQL para normalización generado.", flush=True)
+
+    drop_sql = f"DROP TABLE `{aux_table}`;" if temp_table_erase else ""
+    sql_script = (update_sql + ("\n" + drop_sql if drop_sql else "")).strip()
+
+    print("[END [FINISHED ✅]] SQL para normalización generado.", flush=True)
     return sql_script, pd.DataFrame(fuzzy_results_list)
+
+
+
+
+
+
+
+
 
 
 
