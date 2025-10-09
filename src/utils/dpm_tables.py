@@ -452,310 +452,359 @@ def DType_df_to_df(config: Dict[str, Any]):
 
 
 
+from common.dpm_GCP_ini import _ini_authenticate_API
 # ----------------------------------------------------------------------------
-# table_various_sources_to_DF()
+# table_various_sources_to_DF()  — v2.1 (auth silenciosa + tipos robustos)
 # ----------------------------------------------------------------------------
-def table_various_sources_to_DF(params: dict) -> pd.DataFrame:
+def table_various_sources_to_DF(params: dict):
     """
-    Extrae datos desde distintos orígenes (archivo, Google Sheets, BigQuery o GCS) y los convierte en un DataFrame.
-    
-    Parámetros en params:
-      - (ver docstring completo en la versión original)
-    
-    Retorna:
-      pd.DataFrame: DataFrame con los datos extraídos y procesados.
-    
-    Raises:
-      RuntimeError: Si ocurre un error al extraer o procesar los datos.
-      ValueError: Si faltan parámetros obligatorios para identificar el origen de datos.
+    Extrae datos desde Archivo/Sheets/BigQuery/GCS y devuelve un DataFrame.
+    • Usa keyfile si está disponible (silencia errores de metadata/secret).
+    • Normalización opcional de encabezados.
+    • Conversión robusta de fechas y numéricos.
     """
+
+    import os
     import re
     import io
     import time
+    import unicodedata
     import pandas as pd
 
-    # Para Google Sheets y otros servicios de Google
-    import gspread
+    # Dependencias opcionales
     try:
-        from google.colab import files
-    except ImportError:
-        pass
+        from google.cloud import bigquery
+    except Exception:
+        bigquery = None
+    try:
+        from google.colab import files as colab_files
+    except Exception:
+        colab_files = None
 
-    # ────────────────────────────── Utilidades Comunes ──────────────────────────────
-    def _imprimir_encabezado(mensaje: str) -> None:
-        print(f"\n🔹🔹🔹 {mensaje} 🔹🔹🔹\n", flush=True)
+    # ───────────── Utilidades ─────────────
+    def _imprimir_encabezado(msg: str) -> None:
+        print(f"\n[START ▶️] {msg}\n", flush=True)
 
-    def _validar_comun(params: dict) -> None:
-        if not (params.get('json_keyfile_GCP_secret_id') or params.get('json_keyfile_colab')):
-            raise ValueError("[VALIDATION [ERROR ❌]] Falta el parámetro obligatorio 'json_keyfile_GCP_secret_id' o 'json_keyfile_colab' para autenticación.")
+    def _metricas(df: pd.DataFrame, origen: str, t0: float) -> None:
+        try:
+            print("\n[METRICS [INFO 📊]] INFORME ESTADÍSTICO DEL DATAFRAME", flush=True)
+            print(f"  • Origen: {origen}", flush=True)
+            print(f"  • Filas: {df.shape[0]} | Columnas: {df.shape[1]}", flush=True)
+            print("  • dtypes:", flush=True); print(df.dtypes, flush=True)
+            print(f"  • Tiempo total: {time.time()-t0:0.2f}s", flush=True)
+            print("[END [FINISHED ✅]] Proceso completado con éxito.\n", flush=True)
+        except Exception as e:
+            print(f"[METRICS [WARNING ⚠️]] {e}", flush=True)
 
-    def _apply_common_filters(df: pd.DataFrame, params: dict) -> pd.DataFrame:
-        # Filtrado de filas (si corresponde)
-        row_start = params.get('source_table_row_start', 0)
-        row_end = params.get('source_table_row_end', None)
-        if row_end is not None:
-            df = df.iloc[row_start:row_end]
+    def _es_fuente_archivo(p): return bool(p.get('file_source_table_path', '').strip())
+    def _es_fuente_gsheet(p): return bool(p.get('spreadsheet_source_table_id', '').strip()) and bool(p.get('spreadsheet_source_table_worksheet_name', '').strip())
+    def _es_fuente_gbq(p):    return bool(p.get('GBQ_source_table_name', '').strip())
+    def _es_fuente_gcs(p):    return bool(p.get('GCS_source_table_bucket_name', '').strip()) and bool(p.get('GCS_source_table_file_path', '').strip())
+
+    def _validar(p: dict) -> None:
+        if _es_fuente_archivo(p): return
+        if _es_fuente_gsheet(p) or _es_fuente_gbq(p) or _es_fuente_gcs(p):
+            if not p.get('ini_environment_identificated'):
+                raise ValueError("[VALIDATION [ERROR ❌]] Falta 'ini_environment_identificated'.")
+            if not (p.get('json_keyfile_local') or p.get('json_keyfile_colab') or p.get('json_keyfile_GCP_secret_id')):
+                raise ValueError("[VALIDATION [ERROR ❌]] Falta una credencial: keyfile (local/colab) o secret.")
         else:
-            df = df.iloc[row_start:]
-        
-        # Filtrado de columnas por posición
-        col_start = params.get('source_table_col_start', 0)
-        col_end = params.get('source_table_col_end', None)
-        if col_end is not None:
-            df = df.iloc[:, col_start:col_end]
-        else:
-            df = df.iloc[:, col_start:]
-        
-        # Selección de campos específicos si se indica
-        if 'source_table_fields_list' in params:
-            fields = params['source_table_fields_list']
-            fields = [f for f in fields if f in df.columns]
-            if fields:
-                df = df[fields]
+            raise ValueError("[VALIDATION [ERROR ❌]] Indica exactamente UNA fuente válida.")
+
+    def _apply_common_filters(df: pd.DataFrame, p: dict) -> pd.DataFrame:
+        r0, r1 = p.get('source_table_row_start', 0), p.get('source_table_row_end', None)
+        c0, c1 = p.get('source_table_col_start', 0), p.get('source_table_col_end', None)
+        df = df.iloc[r0:r1] if r1 is not None else df.iloc[r0:]
+        df = df.iloc[:, c0:c1] if c1 is not None else df.iloc[:, c0:]
+        fields = p.get('source_table_fields_list') or []
+        if fields:
+            keep = [f for f in fields if f in df.columns]
+            if keep: df = df[keep]
         return df
 
-    def _auto_convert(df: pd.DataFrame) -> pd.DataFrame:
+    def _strip_cells(df: pd.DataFrame, enable: bool) -> pd.DataFrame:
+        if not enable: return df
+        for c in df.select_dtypes(include=['object', 'string']).columns:
+            try: df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)
+            except Exception as e: print(f"[TRANSFORMATION [WARNING ⚠️]] strip '{c}': {e}", flush=True)
+        return df
+
+    def _normalize_header(name: str, style: str = 'forms') -> str:
+        s = unicodedata.normalize('NFKD', name)
+        s = "".join([c for c in s if not unicodedata.combining(c)]).strip()
+        s = re.sub(r'\s+', ' ', s)
+        s = s.lower()
+        if style == 'snake':
+            s = re.sub(r'[^a-z0-9]+', '_', s)
+        elif style == 'slug':
+            s = re.sub(r'[^a-z0-9]+', '-', s)
+        else:  # forms
+            s = re.sub(r'[^a-z0-9_ ]+', '', s).replace(' ', '_')
+        return re.sub(r'[_-]+', lambda m: m.group(0)[0], s).strip('_-')
+
+    def _normalize_headers(df: pd.DataFrame, use: bool, style: str) -> pd.DataFrame:
+        if not use: return df
+        mapping, seen = {}, set()
         for col in df.columns:
-            col_lower = col.lower()
-            if "fecha" in col_lower or col_lower == "valor":
-                try:
-                    df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
-                except Exception as e:
-                    print(f"[TRANSFORMATION [WARNING ⚠️]] Error al convertir la columna '{col}' a datetime: {e}", flush=True)
-            elif col_lower in ['importe', 'saldo']:
-                try:
-                    df[col] = df[col].apply(lambda x: float(x.replace('.', '').replace(',', '.')) if isinstance(x, str) and x.strip() != '' else x)
-                except Exception as e:
-                    print(f"[TRANSFORMATION [WARNING ⚠️]] Error al convertir la columna '{col}' a float: {e}", flush=True)
+            nc, base, k = _normalize_header(str(col), style), None, 1
+            base = nc
+            while nc in seen:
+                k += 1; nc = f"{base}_{k}"
+            mapping[col] = nc; seen.add(nc)
+        df = df.rename(columns=mapping)
+        print(f"[TRANSFORMATION [SUCCESS ✅]] Encabezados normalizados (estilo='{style}').", flush=True)
         return df
 
-    # ────────────────────────────── Detección del Origen ──────────────────────────────
-    def _es_fuente_archivo(params: dict) -> bool:
-        return bool(params.get('file_source_table_path', '').strip())
+    def _auto_convert(df: pd.DataFrame, auto_dates: bool, auto_numbers: bool) -> pd.DataFrame:
+        try: df = df.convert_dtypes()
+        except Exception: pass
 
-    def _es_fuente_gsheet(params: dict) -> bool:
-        return (not _es_fuente_archivo(params)) and (
-            bool(params.get('spreadsheet_source_table_id', '').strip()) and 
-            bool(params.get('spreadsheet_source_table_worksheet_name', '').strip())
-        )
+        # 1) Heurística de fechas por nombre
+        if auto_dates:
+            for col in df.columns:
+                cl = str(col).lower()
+                if any(k in cl for k in ("fecha", "date", "day", "dt", "updated_at", "created_at")):
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors='coerce', dayfirst=True)
+                    except Exception as e:
+                        print(f"[TRANSFORMATION [WARNING ⚠️]] datetime '{col}': {e}", flush=True)
 
-    def _es_fuente_gbq(params: dict) -> bool:
-        return bool(params.get('GBQ_source_table_name', '').strip())
+        # 2) Heurística de números por nombre
+        if auto_numbers:
+            num_keys = ("importe","monto","valor","precio","saldo","cantidad","total","roas","cpl","ctr","cpc","size","rows","columns","num_")
+            for col in df.columns:
+                cl = str(col).lower()
+                is_candidate = any(k in cl for k in num_keys)
+                if is_candidate:
+                    try:
+                        def _to_float(x):
+                            if isinstance(x, str):
+                                xs = x.strip()
+                                if xs == "": return None
+                                # EU: 1.234,56  |  US: 1,234.56
+                                if xs.count(',') == 1 and xs.count('.') > 1:
+                                    xs = xs.replace('.', '').replace(',', '.')
+                                elif xs.count(',') > 1 and xs.count('.') == 1:
+                                    xs = xs.replace(',', '')
+                                elif xs.count(',') == 1 and xs.count('.') == 0:
+                                    xs = xs.replace(',', '.')
+                                else:
+                                    xs = xs.replace(' ', '')
+                                return float(xs)
+                            return x
+                        df[col] = df[col].map(_to_float)
+                    except Exception as e:
+                        print(f"[TRANSFORMATION [WARNING ⚠️]] numeric '{col}': {e}", flush=True)
 
-    def _es_fuente_gcs(params: dict) -> bool:
-        return bool(params.get('GCS_source_table_bucket_name', '').strip()) and bool(params.get('GCS_source_table_file_path', '').strip())
+        # 3) Conversión numérica por densidad (>=80% casteable) — p.ej. num_rows/size_mb si no cazan por nombre
+        if auto_numbers:
+            for col in df.columns:
+                s = df[col]
+                if pd.api.types.is_numeric_dtype(s): continue
+                try:
+                    cleaned = s.dropna().astype(str).str.strip()
+                    if len(cleaned) == 0: continue
+                    # Intento robusto
+                    tmp = cleaned.str.replace(r'\s', '', regex=True)
+                    tmp = tmp.str.replace(r'\.(?=[0-9]{3}\b)', '', regex=True)  # separador miles .
+                    tmp = tmp.str.replace(r',(?=[0-9]{3}\b)', '', regex=True)  # separador miles ,
+                    tmp = tmp.str.replace(',', '.')  # coma decimal
+                    casted = pd.to_numeric(tmp, errors='coerce')
+                    ratio = casted.notna().mean()
+                    if ratio >= 0.8:
+                        df[col] = pd.to_numeric(tmp, errors='coerce')
+                except Exception:
+                    pass
+        return df
 
-    # ────────────────────────────── Fuente – Archivo Local ──────────────────────────────
-    def _leer_archivo(params: dict) -> pd.DataFrame:
-        _imprimir_encabezado("[START 🚀] Iniciando carga del archivo")
-        file_path = params.get('file_source_table_path')
-        row_skip_empty = params.get('source_table_filter_skip_row_empty_use', True)
-        row_start = params.get('source_table_row_start', 0)
-        row_end = params.get('source_table_row_end', None)
-        nrows = (row_end - row_start) if row_end is not None else None
-        col_start = params.get('source_table_col_start', 0)
-        col_end = params.get('source_table_col_end', None)
+    # ───────────── Auth (silenciosa y predecible) ─────────────
+    def _get_project_id(p: dict) -> str:
+        ie = p.get("ini_environment_identificated")
+        if not ie: raise ValueError("[VALIDATION [ERROR ❌]] Falta 'ini_environment_identificated'.")
+        return os.environ.get("GOOGLE_CLOUD_PROJECT") if ie == "COLAB_ENTERPRISE" else ie
 
+    def _auth_with_scopes(p: dict, scopes: list):
+        """
+        • Prioriza keyfile si está presente (local/colab) → evita metadata/secret y ruido.
+        • Si no hay keyfile, usa _ini_authenticate_API(p, project_id, scopes).
+        """
+        from google.oauth2 import service_account
+        key_local = p.get("json_keyfile_local")
+        key_colab = p.get("json_keyfile_colab")
+        try:
+            if key_local and isinstance(key_local, str) and os.path.exists(key_local):
+                creds = service_account.Credentials.from_service_account_file(key_local, scopes=scopes)
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile: {key_local}", flush=True)
+                return creds
+            if isinstance(key_local, dict) and "client_email" in key_local:
+                creds = service_account.Credentials.from_service_account_info(key_local, scopes=scopes)
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict local.", flush=True)
+                return creds
+            if key_colab and isinstance(key_colab, str) and os.path.exists(key_colab):
+                creds = service_account.Credentials.from_service_account_file(key_colab, scopes=scopes)
+                print(f"[AUTHENTICATION [SUCCESS ✅]] Credenciales desde keyfile (colab): {key_colab}", flush=True)
+                return creds
+            if isinstance(key_colab, dict) and "client_email" in key_colab:
+                creds = service_account.Credentials.from_service_account_info(key_colab, scopes=scopes)
+                print("[AUTHENTICATION [SUCCESS ✅]] Credenciales desde dict colab.", flush=True)
+                return creds
+        except Exception as e:
+            print(f"[AUTHENTICATION [WARNING ⚠️]] Keyfile presente pero no utilizable: {e}", flush=True)
+
+        # Fallback: helper (puede intentar Secret Manager/ADC)
+        project_id = _get_project_id(p)
+        try:
+            creds = _ini_authenticate_API(p, project_id, scopes)
+            print("[AUTHENTICATION [SUCCESS ✅]] Credenciales obtenidas por helper.", flush=True)
+            return creds
+        except Exception as e:
+            raise RuntimeError(f"[AUTHENTICATION [ERROR ❌]] {e}")
+
+    # ───────────── Lectores ─────────────
+    def _leer_archivo(p: dict) -> pd.DataFrame:
+        _imprimir_encabezado("Cargando archivo local")
+        file_path = p.get('file_source_table_path')
+        skip_empty = p.get('source_table_filter_skip_row_empty_use', True)
         if not file_path:
-            print("[EXTRACTION [WARNING ⚠️]] No se proporcionó 'file_source_table_path'. Suba un archivo desde su ordenador:", flush=True)
-            uploaded = files.upload()
-            file_path = list(uploaded.keys())[0]
-            file_input = io.BytesIO(uploaded[file_path])
-            print(f"[EXTRACTION [SUCCESS ✅]] Archivo '{file_path}' subido exitosamente.", flush=True)
+            if colab_files is None:
+                raise RuntimeError("[EXTRACTION [ERROR ❌]] Sin ruta de archivo y no estamos en Colab.")
+            print("[EXTRACTION [INFO ℹ️]] Selecciona un archivo…", flush=True)
+            up = colab_files.upload()
+            file_path = list(up.keys())[0]
+            file_input = io.BytesIO(up[file_path])
+            print(f"[EXTRACTION [SUCCESS ✅]] Subido '{file_path}'.", flush=True)
         else:
             file_input = file_path
-
-        _, ext = os.path.splitext(file_path)
-        ext = ext.lower()
-
+        _, ext = os.path.splitext(file_path); ext = ext.lower()
         try:
-            print(f"[EXTRACTION [START ⏳]] Leyendo archivo '{file_path}'...", flush=True)
-            if ext in ['.xls', '.xlsx']:
+            print(f"[EXTRACTION [START ⏳]] Leyendo '{file_path}'…", flush=True)
+            if ext in ('.xls', '.xlsx'):
                 engine = 'xlrd' if ext == '.xls' else 'openpyxl'
-                df = pd.read_excel(file_input, engine=engine, skiprows=row_start, nrows=nrows)
+                df = pd.read_excel(file_input, engine=engine)
             elif ext == '.csv':
-                df = pd.read_csv(file_input, skiprows=row_start, nrows=nrows, sep=',')
+                df = pd.read_csv(file_input, sep=',')
             elif ext == '.tsv':
-                df = pd.read_csv(file_input, skiprows=row_start, nrows=nrows, sep='\t')
+                df = pd.read_csv(file_input, sep='\t')
             else:
-                raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Extensión de archivo '{ext}' no soportada.")
-            
-            if col_end is not None:
-                df = df.iloc[:, col_start:col_end]
-            else:
-                df = df.iloc[:, col_start:]
-            
-            if row_skip_empty:
-                initial_rows = len(df)
-                df.dropna(how='all', inplace=True)
-                removed_rows = initial_rows - len(df)
-                print(f"[TRANSFORMATION [SUCCESS ✅]] Se eliminaron {removed_rows} filas vacías.", flush=True)
-            
-            df = df.convert_dtypes()
-            df = _auto_convert(df)
-
-            print("\n[METRICS [INFO 📊]] INFORME ESTADÍSTICO DEL DATAFRAME:")
-            print(f"  - Total filas: {df.shape[0]}")
-            print(f"  - Total columnas: {df.shape[1]}")
-            print("  - Tipos de datos por columna:")
-            print(df.dtypes)
-            print("  - Resumen estadístico (numérico):")
-            print(df.describe())
-            print("  - Resumen estadístico (incluyendo variables categóricas):")
-            print(df.describe(include='all'))
-            print(f"\n[END [FINISHED 🏁]] Archivo '{file_path}' cargado correctamente. Filas: {df.shape[0]}, Columnas: {df.shape[1]}", flush=True)
+                raise RuntimeError(f"Extensión '{ext}' no soportada.")
+            if skip_empty:
+                before = len(df); df = df.dropna(how='all')
+                print(f"[TRANSFORMATION [SUCCESS ✅]] Filas vacías eliminadas: {before - len(df)}", flush=True)
             return df
-
         except Exception as e:
-            error_message = f"[EXTRACTION [ERROR ❌]] Error al leer el archivo '{file_path}': {e}"
-            print(error_message, flush=True)
-            raise RuntimeError(error_message)
+            raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Archivo: {e}")
 
-    # ────────────────────────────── Fuente – Google Sheets ──────────────────────────────
-    def _leer_google_sheet(params: dict) -> pd.DataFrame:
+    def _leer_google_sheet(p: dict) -> pd.DataFrame:
         from googleapiclient.discovery import build
-
-        spreadsheet_id_raw = params.get("spreadsheet_source_table_id")
-        if "spreadsheets/d/" in spreadsheet_id_raw:
-            match = re.search(r"/d/([a-zA-Z0-9-_]+)", spreadsheet_id_raw)
-            if match:
-                spreadsheet_id = match.group(1)
-            else:
-                raise ValueError("[VALIDATION [ERROR ❌]] No se pudo extraer el ID de la hoja de cálculo desde la URL proporcionada.")
+        raw = p.get("spreadsheet_source_table_id")
+        if "spreadsheets/d/" in str(raw):
+            m = re.search(r"/d/([a-zA-Z0-9-_]+)", raw)
+            if not m: raise ValueError("[VALIDATION [ERROR ❌]] No se pudo extraer el ID.")
+            sid = m.group(1)
         else:
-            spreadsheet_id = spreadsheet_id_raw
+            sid = raw
+        sheet = p.get("spreadsheet_source_table_worksheet_name")
+        if not sid or not sheet:
+            raise ValueError("[VALIDATION [ERROR ❌]] Faltan ID y/o worksheet.")
 
-        worksheet_name = params.get("spreadsheet_source_table_worksheet_name")
-        if not spreadsheet_id or not worksheet_name:
-            raise ValueError("[VALIDATION [ERROR ❌]] Faltan 'spreadsheet_source_table_id' o 'spreadsheet_source_table_worksheet_name'.")
-
+        scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+        creds = _auth_with_scopes(p, scopes)
         try:
-            scope_list = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
-            ]
-            # Determinación del project_id según el entorno
-            ini_env = params.get("ini_environment_identificated")
-            if not ini_env:
-                raise ValueError("[VALIDATION [ERROR ❌]] Falta la key 'ini_environment_identificated' en params.")
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") if ini_env == "COLAB_ENTERPRISE" else ini_env
-
-            # Uso de _ini_authenticate_API para la autenticación
-            creds = _ini_authenticate_API(params, project_id)
-            creds = creds.with_scopes(scope_list)
-            
-            service = build('sheets', 'v4', credentials=creds)
-            range_name = f"{worksheet_name}"
-            print("[EXTRACTION [START ⏳]] Extrayendo datos de Google Sheets...", flush=True)
-            result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
-            data = result.get('values', [])
+            svc = build('sheets', 'v4', credentials=creds)
+            print("[EXTRACTION [START ⏳]] Extrayendo datos de Google Sheets…", flush=True)
+            result = svc.spreadsheets().values().get(
+                spreadsheetId=sid,
+                range=sheet,
+                valueRenderOption="UNFORMATTED_VALUE",
+                dateTimeRenderOption="SERIAL_NUMBER"
+            ).execute()
+            data = result.get('values', []) or []
             if not data:
-                print("[EXTRACTION [WARNING ⚠️]] No se encontraron datos en la hoja especificada.", flush=True)
+                print("[EXTRACTION [WARNING ⚠️]] Hoja sin datos.", flush=True)
                 return pd.DataFrame()
-            
-            # Se obtiene el encabezado y se ajustan las filas para que todas tengan la misma longitud.
-            header = data[0]
-            n_columns = len(header)
-            data_fixed = []
-            for row in data[1:]:
-                if len(row) < n_columns:
-                    row = row + [None] * (n_columns - len(row))
-                elif len(row) > n_columns:
-                    row = row[:n_columns]
-                data_fixed.append(row)
-
-            df = pd.DataFrame(data_fixed, columns=header)
-            print(f"[EXTRACTION [SUCCESS ✅]] Datos extraídos con éxito de la hoja '{worksheet_name}'.", flush=True)
-            return df
-
-        except Exception as e:
-            raise ValueError(f"[EXTRACTION [ERROR ❌]] Error al extraer datos de Google Sheets: {e}")
-
-    # ────────────────────────────── Fuente – BigQuery ──────────────────────────────
-    def _leer_gbq(params: dict) -> pd.DataFrame:
-        scope_list = ["https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/drive"]
-        ini_env = params.get("ini_environment_identificated")
-        if not ini_env:
-            raise ValueError("[VALIDATION [ERROR ❌]] Falta la key 'ini_environment_identificated' en params.")
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") if ini_env == "COLAB_ENTERPRISE" else ini_env
-
-        # Uso de _ini_authenticate_API para la autenticación en BigQuery
-        from google.oauth2.service_account import Credentials
-        creds = _ini_authenticate_API(params, project_id)
-        creds = creds.with_scopes(scope_list)
-    
-        client_bq = bigquery.Client(credentials=creds, project=project_id)
-        gbq_table = params.get("GBQ_source_table_name")
-        if not gbq_table:
-            raise ValueError("[VALIDATION [ERROR ❌]] Falta el parámetro 'GBQ_source_table_name' para BigQuery.")
-        try:
-            query = f"SELECT * FROM `{gbq_table}`"
-            print(f"[EXTRACTION [START ⏳]] Ejecutando consulta en BigQuery: {query}", flush=True)
-            df = client_bq.query(query).to_dataframe()
-            print("[EXTRACTION [SUCCESS ✅]] Datos extraídos con éxito de BigQuery.", flush=True)
+            header, rows = data[0], data[1:]
+            n = len(header)
+            fixed = [(r + [None]*(n-len(r)))[:n] for r in rows]
+            df = pd.DataFrame(fixed, columns=header)
+            print(f"[EXTRACTION [SUCCESS ✅]] Datos leídos de '{sheet}'.", flush=True)
             return df
         except Exception as e:
-            raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Error al extraer datos de BigQuery: {e}")
+            raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Sheets: {e}")
 
-    # ────────────────────────────── Fuente – Google Cloud Storage (GCS) ──────────────────────────────
-    def _leer_gcs(params: dict) -> pd.DataFrame:
-        scope_list = ["https://www.googleapis.com/auth/devstorage.read_only"]
-        ini_env = params.get("ini_environment_identificated")
-        if not ini_env:
-            raise ValueError("[VALIDATION [ERROR ❌]] Falta la key 'ini_environment_identificated' en params.")
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") if ini_env == "COLAB_ENTERPRISE" else ini_env
-
-        # Uso de _ini_authenticate_API para la autenticación en GCS
-        from google.oauth2.service_account import Credentials
-        creds = _ini_authenticate_API(params, project_id)
-        creds = creds.with_scopes(scope_list)
-    
+    def _leer_gbq(p: dict) -> pd.DataFrame:
+        if bigquery is None:
+            raise RuntimeError("[EXTRACTION [ERROR ❌]] Falta paquete 'google-cloud-bigquery'.")
+        table = p.get("GBQ_source_table_name")
+        if not table:
+            raise ValueError("[VALIDATION [ERROR ❌]] Falta 'GBQ_source_table_name'.")
+        scopes = ["https://www.googleapis.com/auth/bigquery","https://www.googleapis.com/auth/drive"]
+        creds = _auth_with_scopes(p, scopes)
+        proj = _get_project_id(p)
         try:
-            bucket_name = params.get("GCS_source_table_bucket_name")
-            file_path = params.get("GCS_source_table_file_path")
-            if not bucket_name or not file_path:
-                raise ValueError("[VALIDATION [ERROR ❌]] Faltan 'GCS_source_table_bucket_name' o 'GCS_source_table_file_path'.")
-            from google.cloud import storage
-            client_storage = storage.Client(credentials=creds, project=project_id)
-            bucket = client_storage.bucket(bucket_name)
-            blob = bucket.blob(file_path)
-            print(f"[EXTRACTION [START ⏳]] Descargando archivo '{file_path}' del bucket '{bucket_name}'...", flush=True)
-            file_bytes = blob.download_as_bytes()
-            _, ext = os.path.splitext(file_path)
-            ext = ext.lower()
-            if ext in ['.xls', '.xlsx']:
+            q = f"SELECT * FROM `{table}`"
+            print(f"[EXTRACTION [START ⏳]] Ejecutando consulta: {q}", flush=True)
+            client = bigquery.Client(credentials=creds, project=proj)
+            return client.query(q).to_dataframe()
+        except Exception as e:
+            raise RuntimeError(f"[EXTRACTION [ERROR ❌]] BigQuery: {e}")
+
+    def _leer_gcs(p: dict) -> pd.DataFrame:
+        from google.cloud import storage
+        bkt, path = p.get("GCS_source_table_bucket_name"), p.get("GCS_source_table_file_path")
+        if not bkt or not path:
+            raise ValueError("[VALIDATION [ERROR ❌]] Faltan bucket y/o file path.")
+        scopes = ["https://www.googleapis.com/auth/devstorage.read_only"]
+        creds = _auth_with_scopes(p, scopes)
+        proj = _get_project_id(p)
+        try:
+            print(f"[EXTRACTION [START ⏳]] Descargando 'gs://{bkt}/{path}'…", flush=True)
+            client = storage.Client(credentials=creds, project=proj)
+            raw = client.bucket(bkt).blob(path).download_as_bytes()
+            _, ext = os.path.splitext(path); ext = ext.lower()
+            if ext in ('.xls', '.xlsx'):
                 engine = 'xlrd' if ext == '.xls' else 'openpyxl'
-                df = pd.read_excel(io.BytesIO(file_bytes), engine=engine)
+                df = pd.read_excel(io.BytesIO(raw), engine=engine)
             elif ext == '.csv':
-                df = pd.read_csv(io.BytesIO(file_bytes), sep=',')
+                df = pd.read_csv(io.BytesIO(raw), sep=',')
             elif ext == '.tsv':
-                df = pd.read_csv(io.BytesIO(file_bytes), sep='\t')
+                df = pd.read_csv(io.BytesIO(raw), sep='\t')
             else:
-                raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Extensión de archivo '{ext}' no soportada en GCS.")
-            print("[EXTRACTION [SUCCESS ✅]] Archivo descargado y leído desde GCS.", flush=True)
+                raise RuntimeError(f"Extensión '{ext}' no soportada en GCS.")
+            print("[EXTRACTION [SUCCESS ✅]] Archivo leído desde GCS.", flush=True)
             return df
         except Exception as e:
-            raise RuntimeError(f"[EXTRACTION [ERROR ❌]] Error al leer archivo desde GCS: {e}")
+            raise RuntimeError(f"[EXTRACTION [ERROR ❌]] GCS: {e}")
 
-    # ────────────────────────────── PROCESO PRINCIPAL ──────────────────────────────
-    _validar_comun(params)
-    if _es_fuente_archivo(params):
-        df = _leer_archivo(params)
-    elif _es_fuente_gsheet(params):
-        df = _leer_google_sheet(params)
-    elif _es_fuente_gbq(params):
-        df = _leer_gbq(params)
-    elif _es_fuente_gcs(params):
-        df = _leer_gcs(params)
-    else:
-        raise ValueError(
-            "[VALIDATION [ERROR ❌]] No se han proporcionado parámetros válidos para identificar el origen de datos. "
-            "Defina 'file_source_table_path', 'spreadsheet_source_table_id' y 'spreadsheet_source_table_worksheet_name', "
-            "'GBQ_source_table_name' o 'GCS_source_table_bucket_name' y 'GCS_source_table_file_path'."
-        )
+    # ───────────── Flujo principal ─────────────
+    t0 = time.time()
+    try:
+        _validar(params)
+        fuentes = [_es_fuente_archivo(params), _es_fuente_gsheet(params), _es_fuente_gbq(params), _es_fuente_gcs(params)]
+        if sum(map(bool, fuentes)) != 1:
+            raise ValueError("[VALIDATION [ERROR ❌]] Indica UNA sola fuente (archivo | gsheet | gbq | gcs).")
 
-    df = _apply_common_filters(df, params)
-    return df
+        if _es_fuente_archivo(params):
+            origen, df = "Archivo local", _leer_archivo(params)
+        elif _es_fuente_gsheet(params):
+            origen, df = "Google Sheets", _leer_google_sheet(params)
+        elif _es_fuente_gbq(params):
+            origen, df = "BigQuery", _leer_gbq(params)
+        else:
+            origen, df = "Google Cloud Storage", _leer_gcs(params)
+
+        df = _apply_common_filters(df, params)
+        df = _strip_cells(df, params.get("strip_whitespace_cells", True))
+        df = _normalize_headers(df, params.get("normalize_headers_use", False), params.get("normalize_headers_style", "forms"))
+        df = _auto_convert(df, params.get("auto_convert_dates", True), params.get("auto_convert_numbers", True))
+
+        _metricas(df, origen, t0)
+        return df
+    except (ValueError, RuntimeError) as e:
+        print(f"[END [ERROR ❌]] {e}", flush=True); raise
+    except Exception as e:
+        print(f"[PROCESS ERROR ❌] {e}", flush=True); raise
+
+
 
 
 
