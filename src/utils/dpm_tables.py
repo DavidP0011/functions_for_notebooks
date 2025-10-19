@@ -917,35 +917,6 @@ def table_DF_to_various_targets(params: dict) -> None:
         raise ValueError("[VALIDATION [ERROR ❌]] No se pudo determinar 'gcp_project_id'. "
                          "Pase 'gcp_project_id' o use una tabla 'project.dataset.table'.")
 
-    def _ini_authenticate_API(p: dict, project_id_str: str, scopes: list) -> Credentials:
-        """
-        Autenticación mínima basada en el entorno, devolviendo Credentials con scopes.
-        (Si ya tienes tu propio helper, puedes sustituir esta función por el tuyo.)
-        """
-        from google.oauth2.service_account import Credentials as SACreds
-        env = (p.get("ini_environment_identificated") or "").upper()
-        key_local = p.get("json_keyfile_local")
-        key_colab = p.get("json_keyfile_colab")
-        # Para GCP/CE usa ADC si no hay key explícita
-        key_gcp_secret = p.get("json_keyfile_GCP_secret_id")
-
-        # Prioridad: local/colab si existen → si no, ADC
-        key_candidate = None
-        if env == "LOCAL" and key_local:
-            key_candidate = key_local
-        elif env == "COLAB" and key_colab:
-            key_candidate = key_colab
-        elif env in {"GCP", "COLAB_ENTERPRISE"} and key_local:
-            # Permite forzar un keyfile incluso en GCP si lo pasas
-            key_candidate = key_local
-
-        if key_candidate and os.path.exists(key_candidate):
-            creds = SACreds.from_service_account_file(key_candidate, scopes=scopes)
-        else:
-            # Application Default Credentials (p.ej. VM con SA adjunta)
-            from google.auth import default as default_auth
-            creds, _ = default_auth(scopes=scopes)
-        return creds
 
     # ──────────────────────────── SUB-FUNCIONES DE ESCRITURA ───────────────────
     def _escribir_archivo(p: dict, d: pd.DataFrame) -> None:
